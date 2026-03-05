@@ -1,3 +1,8 @@
+"""Minimal ECS storage layer.
+
+The store maps component types to per-entity component instances.
+"""
+
 from collections import defaultdict
 from typing import TypeVar, cast
 
@@ -5,9 +10,21 @@ T = TypeVar("T")
 
 
 class ECSStore:
+    """In-memory ECS component index keyed by component type and entity ID."""
+
     def __init__(self) -> None:
         self._next_entity_id = 1
         self._components: dict[type[object], dict[int, object]] = defaultdict(dict)
+
+    @property
+    def next_entity_id(self) -> int:
+        return self._next_entity_id
+
+    def set_next_entity_id(self, next_entity_id: int) -> None:
+        if next_entity_id < 1:
+            msg = "next_entity_id must be positive."
+            raise ValueError(msg)
+        self._next_entity_id = next_entity_id
 
     def create_entity(self) -> int:
         entity_id = self._next_entity_id
