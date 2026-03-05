@@ -1,0 +1,1 @@
+"""ADOM-inspired roguelike prototype."""
