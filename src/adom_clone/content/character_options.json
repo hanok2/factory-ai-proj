@@ -1,0 +1,54 @@
+{
+  "races": [
+    {
+      "id": "human",
+      "name": "Human",
+      "hp_bonus": 0,
+      "power_bonus": 0,
+      "defense_bonus": 0,
+      "hunger_max": 120
+    },
+    {
+      "id": "dwarf",
+      "name": "Dwarf",
+      "hp_bonus": 4,
+      "power_bonus": 0,
+      "defense_bonus": 1,
+      "hunger_max": 130
+    },
+    {
+      "id": "elf",
+      "name": "Elf",
+      "hp_bonus": -1,
+      "power_bonus": 1,
+      "defense_bonus": 0,
+      "hunger_max": 110
+    }
+  ],
+  "classes": [
+    {
+      "id": "fighter",
+      "name": "Fighter",
+      "base_hp": 20,
+      "base_power": 5,
+      "base_defense": 1,
+      "starting_items": ["short_sword", "leather_armor", "ration"]
+    },
+    {
+      "id": "thief",
+      "name": "Thief",
+      "base_hp": 16,
+      "base_power": 4,
+      "base_defense": 1,
+      "starting_items": ["dagger", "leather_armor", "ration"]
+    },
+    {
+      "id": "wizard",
+      "name": "Wizard",
+      "base_hp": 14,
+      "base_power": 3,
+      "base_defense": 0,
+      "starting_items": ["oak_staff", "ration", "healing_potion"]
+    }
+  ]
+}

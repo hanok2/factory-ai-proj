@@ -20,8 +20,10 @@ class TileMap:
     width: int
     height: int
     tiles: list[list[Tile]]
+    depth: int = 0
     entrance_pos: tuple[int, int] | None = None
     exit_pos: tuple[int, int] | None = None
+    stairs_down_pos: tuple[int, int] | None = None
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height

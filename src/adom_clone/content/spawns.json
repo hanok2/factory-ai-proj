@@ -1,0 +1,91 @@
+{
+  "item_templates": {
+    "healing_herb": {
+      "name": "healing herb",
+      "heal_amount": 4
+    },
+    "healing_potion": {
+      "name": "small healing potion",
+      "heal_amount": 6
+    },
+    "ration": {
+      "name": "ration",
+      "nutrition": 45
+    },
+    "short_sword": {
+      "name": "short sword",
+      "equip_slot": "weapon",
+      "power_bonus": 2
+    },
+    "dagger": {
+      "name": "dagger",
+      "equip_slot": "weapon",
+      "power_bonus": 1
+    },
+    "oak_staff": {
+      "name": "oak staff",
+      "equip_slot": "weapon",
+      "power_bonus": 1,
+      "defense_bonus": 1
+    },
+    "leather_armor": {
+      "name": "leather armor",
+      "equip_slot": "armor",
+      "defense_bonus": 2
+    }
+  },
+  "monster_templates": {
+    "giant_rat": {
+      "name": "giant rat",
+      "hp": 8,
+      "power": 3,
+      "defense": 0
+    },
+    "goblin": {
+      "name": "goblin",
+      "hp": 12,
+      "power": 4,
+      "defense": 1
+    },
+    "orc": {
+      "name": "orc",
+      "hp": 16,
+      "power": 5,
+      "defense": 2
+    }
+  },
+  "overworld_items": [
+    {
+      "template": "healing_herb",
+      "count": 1
+    },
+    {
+      "template": "ration",
+      "count": 1
+    }
+  ],
+  "dungeon_items": [
+    {
+      "template": "healing_potion",
+      "count": 1
+    },
+    {
+      "template": "ration",
+      "count": 1
+    }
+  ],
+  "dungeon_monsters": [
+    {
+      "template": "giant_rat",
+      "count": 2
+    },
+    {
+      "template": "goblin",
+      "count": 2
+    },
+    {
+      "template": "orc",
+      "count": 1
+    }
+  ]
+}

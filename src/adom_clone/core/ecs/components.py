@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 
 from adom_clone.core.world.map_model import MapKind
 
@@ -22,6 +23,7 @@ class Monster:
 @dataclass(slots=True)
 class OnMap:
     kind: MapKind
+    depth: int | None = None
 
 
 @dataclass(slots=True)
@@ -51,3 +53,32 @@ class Item:
 @dataclass(slots=True)
 class Consumable:
     heal_amount: int
+
+
+class EquipmentSlot(str, Enum):
+    WEAPON = "weapon"
+    ARMOR = "armor"
+
+
+@dataclass(slots=True)
+class Equippable:
+    slot: EquipmentSlot
+    power_bonus: int = 0
+    defense_bonus: int = 0
+
+
+@dataclass(slots=True)
+class Equipment:
+    weapon_item_id: int | None = None
+    armor_item_id: int | None = None
+
+
+@dataclass(slots=True)
+class Food:
+    nutrition: int
+
+
+@dataclass(slots=True)
+class Hunger:
+    current: int
+    max_value: int

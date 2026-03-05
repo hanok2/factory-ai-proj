@@ -1,18 +1,18 @@
-"""Game session orchestration for the ADOM-inspired vertical slice.
+"""Game session orchestration for the ADOM-inspired vertical slice."""
 
-This module coordinates map state, ECS entities/components, turn processing,
-combat, inventory interactions, and persistence.
-"""
-
-import json
+import random
 from collections import deque
-from pathlib import Path
-from typing import cast
+from dataclasses import dataclass
 
 from adom_clone.core.ecs.components import (
     BlocksMovement,
     Consumable,
+    Equipment,
+    EquipmentSlot,
+    Equippable,
     Fighter,
+    Food,
+    Hunger,
     Inventory,
     Item,
     Monster,
@@ -21,42 +21,88 @@ from adom_clone.core.ecs.components import (
     Position,
 )
 from adom_clone.core.ecs.store import ECSStore
-from adom_clone.core.game.actions import (
-    DropLastItemAction,
-    GameAction,
-    MoveAction,
-    PickupAction,
-    UseItemAction,
-    WaitAction,
+from adom_clone.core.game.actions import GameAction
+from adom_clone.core.game.content import (
+    ClassDefinition,
+    ItemTemplate,
+    MonsterTemplate,
+    RaceDefinition,
+    SpawnRule,
+    load_character_content,
+    load_spawn_content,
 )
-from adom_clone.core.world.generators import generate_dungeon, generate_overworld
+from adom_clone.core.game.systems import (
+    AISystem,
+    CombatSystem,
+    InventorySystem,
+    PersistenceSystem,
+    TurnSystem,
+)
+from adom_clone.core.world.generators import generate_dungeon_levels, generate_overworld
 from adom_clone.core.world.map_model import MapKind, TileMap
 
 
-class GameSession:
-    """Owns runtime game state and applies queued player turns."""
+@dataclass(frozen=True)
+class CharacterSelection:
+    race_id: str
+    class_id: str
+    seed: int
 
-    def __init__(self) -> None:
+
+class GameSession:
+    """Owns runtime game state and delegates behavior to domain systems."""
+
+    def __init__(
+        self,
+        seed: int = 1337,
+        race_id: str = "human",
+        class_id: str = "fighter",
+        dungeon_level_count: int = 3,
+    ) -> None:
+        self.seed = seed
+        self.rng = random.Random(seed)
+
+        races, classes = load_character_content()
+        self.spawn_content = load_spawn_content()
+        self.race = _find_race(races, race_id)
+        self.character_class = _find_class(classes, class_id)
+        self.race_id = self.race.id
+        self.class_id = self.character_class.id
+
         self.ecs = ECSStore()
         self.overworld = generate_overworld()
-        self.dungeon = generate_dungeon()
+        self.dungeon_levels = generate_dungeon_levels(dungeon_level_count, seed)
+        self.dungeon = self.dungeon_levels[0]
         self.current_map: TileMap = self.overworld
+        self.current_depth: int | None = None
+
         self.messages: list[str] = []
         self.game_over = False
         self.turn_count = 0
         self.kill_count = 0
         self._action_queue: deque[GameAction] = deque()
 
-        self.player_entity = self.ecs.create_entity()
-        self.ecs.add_component(self.player_entity, Player())
-        self.ecs.add_component(self.player_entity, Position(2, 2))
-        self.ecs.add_component(self.player_entity, OnMap(MapKind.OVERWORLD))
-        self.ecs.add_component(self.player_entity, BlocksMovement())
-        self.ecs.add_component(self.player_entity, Fighter(max_hp=20, hp=20, power=5, defense=1))
-        self.ecs.add_component(self.player_entity, Inventory(capacity=10))
+        self.turn_system = TurnSystem()
+        self.combat_system = CombatSystem()
+        self.inventory_system = InventorySystem()
+        self.ai_system = AISystem()
+        self.persistence_system = PersistenceSystem()
 
-        self._spawn_initial_content()
-        self.add_message("You arrive in the Drakalor wilderness.")
+        self.player_entity = self.ecs.create_entity()
+        self._spawn_player()
+        self._spawn_world_content()
+        self._grant_starting_loadout()
+
+        self.add_message(
+            (
+                f"You begin your journey as a {self.race.name} "
+                f"{self.character_class.name} (seed {self.seed})."
+            ),
+        )
+
+    @property
+    def dungeon_level_count(self) -> int:
+        return len(self.dungeon_levels)
 
     @property
     def player_position(self) -> Position:
@@ -91,45 +137,64 @@ class GameSession:
         return on_map
 
     @property
+    def player_hunger(self) -> Hunger:
+        hunger = self.ecs.get_component(self.player_entity, Hunger)
+        if hunger is None:
+            msg = "Player entity is missing Hunger component."
+            raise RuntimeError(msg)
+        return hunger
+
+    @property
+    def player_equipment(self) -> Equipment:
+        equipment = self.ecs.get_component(self.player_entity, Equipment)
+        if equipment is None:
+            msg = "Player entity is missing Equipment component."
+            raise RuntimeError(msg)
+        return equipment
+
+    @property
     def player_hp_text(self) -> str:
         fighter = self.player_fighter
         return f"{fighter.hp}/{fighter.max_hp}"
 
+    @property
+    def player_hunger_text(self) -> str:
+        hunger = self.player_hunger
+        return f"{hunger.current}/{hunger.max_value}"
+
+    @property
+    def player_power(self) -> int:
+        return self.combat_system.effective_power(self, self.player_entity)
+
+    @property
+    def player_defense(self) -> int:
+        return self.combat_system.effective_defense(self, self.player_entity)
+
     def add_message(self, text: str) -> None:
-        """Append a UI message while keeping a bounded in-memory log."""
         self.messages.append(text)
-        if len(self.messages) > 200:
-            del self.messages[:-200]
+        if len(self.messages) > 250:
+            del self.messages[:-250]
 
     def queue_action(self, action: GameAction) -> None:
         self._action_queue.append(action)
 
     def advance_turn(self) -> None:
-        """Advance one player action and then one monster phase."""
-        if self.game_over or not self._action_queue:
-            return
+        self.turn_system.advance_turn(self)
 
-        action = self._action_queue.popleft()
-        acted = self._apply_action(action)
-        if acted and not self.game_over:
-            self.turn_count += 1
-            self._run_monster_turns()
+    def tick_hunger(self) -> None:
+        hunger = self.player_hunger
+        hunger.current -= 1
 
-    def _apply_action(self, action: GameAction) -> bool:
-        if isinstance(action, MoveAction):
-            return self._apply_move(action.dx, action.dy)
-        if isinstance(action, PickupAction):
-            return self._pickup_item()
-        if isinstance(action, UseItemAction):
-            return self._use_item(action.slot_index)
-        if isinstance(action, DropLastItemAction):
-            return self._drop_last_item()
-        if isinstance(action, WaitAction):
-            self.add_message("You wait.")
-            return True
-        return False
+        if hunger.current in (80, 50, 25, 10):
+            self.add_message("You feel hungry.")
+        if hunger.current <= 0:
+            fighter = self.player_fighter
+            fighter.hp -= 1
+            self.add_message("You are starving!")
+            if fighter.hp <= 0:
+                self._handle_death(self.player_entity)
 
-    def _apply_move(self, dx: int, dy: int) -> bool:
+    def apply_move(self, dx: int, dy: int) -> bool:
         position = self.player_position
         nx = position.x + dx
         ny = position.y + dy
@@ -137,11 +202,16 @@ class GameSession:
         if not self.current_map.is_passable(nx, ny):
             return False
 
-        blocker = self._blocking_entity_at(nx, ny, self.current_map.kind, self.player_entity)
+        blocker = self.blocking_entity_at(
+            nx,
+            ny,
+            self.current_map.kind,
+            self.current_depth,
+            self.player_entity,
+        )
         if blocker is not None:
-            # Bumping into a hostile blocker resolves as a melee attack instead of movement.
             if self.ecs.get_component(blocker, Monster) is not None:
-                self._attack(self.player_entity, blocker)
+                self.combat_system.attack(self, self.player_entity, blocker)
                 return True
             return False
 
@@ -150,130 +220,53 @@ class GameSession:
         self._handle_transition_if_needed()
         return True
 
-    def _pickup_item(self) -> bool:
-        position = self.player_position
-        item_entities = self._items_at(self.current_map.kind, position.x, position.y)
-        if not item_entities:
-            self.add_message("There is nothing to pick up.")
-            return False
-
-        inventory = self.player_inventory
-        if len(inventory.item_ids) >= inventory.capacity:
-            self.add_message("Your inventory is full.")
-            return False
-
-        item_entity = item_entities[0]
-        inventory.item_ids.append(item_entity)
-        self.ecs.remove_component(item_entity, Position)
-        self.ecs.remove_component(item_entity, OnMap)
-        item = self.ecs.get_component(item_entity, Item)
-        item_name = item.name if item is not None else "item"
-        self.add_message(f"You pick up {item_name}.")
-        return True
-
-    def _use_item(self, slot_index: int) -> bool:
-        inventory = self.player_inventory
-        if slot_index < 0 or slot_index >= len(inventory.item_ids):
-            self.add_message("No item in that slot.")
-            return False
-
-        item_entity = inventory.item_ids[slot_index]
-        consumable = self.ecs.get_component(item_entity, Consumable)
-        item = self.ecs.get_component(item_entity, Item)
-
-        if consumable is None or item is None:
-            self.add_message("You can't use that item.")
-            return False
-
-        fighter = self.player_fighter
-        before_hp = fighter.hp
-        fighter.hp = min(fighter.max_hp, fighter.hp + consumable.heal_amount)
-        healed = fighter.hp - before_hp
-
-        inventory.item_ids.pop(slot_index)
-        self._destroy_item(item_entity)
-
-        if healed > 0:
-            self.add_message(f"You use {item.name} and recover {healed} HP.")
-        else:
-            self.add_message(f"You use {item.name}, but nothing happens.")
-        return True
-
-    def _drop_last_item(self) -> bool:
-        inventory = self.player_inventory
-        if not inventory.item_ids:
-            self.add_message("You have nothing to drop.")
-            return False
-
-        item_entity = inventory.item_ids.pop()
-        position = self.player_position
-        self.ecs.add_component(item_entity, Position(position.x, position.y))
-        self.ecs.add_component(item_entity, OnMap(self.current_map.kind))
-        item = self.ecs.get_component(item_entity, Item)
-        item_name = item.name if item is not None else "item"
-        self.add_message(f"You drop {item_name}.")
-        return True
-
-    def _run_monster_turns(self) -> None:
-        """Execute simple chase/attack AI for monsters on the active map."""
-        player_position = self.player_position
-        for entity_id, _monster in self.ecs.entities_with(Monster):
-            if self.game_over:
-                return
-
+    def blocking_entity_at(
+        self,
+        x: int,
+        y: int,
+        map_kind: MapKind,
+        depth: int | None,
+        excluded_entity: int,
+    ) -> int | None:
+        for entity_id, _blocker in self.ecs.entities_with(BlocksMovement):
+            if entity_id == excluded_entity:
+                continue
             position = self.ecs.get_component(entity_id, Position)
             on_map = self.ecs.get_component(entity_id, OnMap)
-            fighter = self.ecs.get_component(entity_id, Fighter)
-            if position is None or on_map is None or fighter is None or fighter.hp <= 0:
+            if position is None or on_map is None:
                 continue
-            if on_map.kind != self.current_map.kind:
+            if (
+                on_map.kind == map_kind
+                and on_map.depth == depth
+                and position.x == x
+                and position.y == y
+            ):
+                return entity_id
+        return None
+
+    def items_at(self, map_kind: MapKind, depth: int | None, x: int, y: int) -> list[int]:
+        items: list[int] = []
+        for entity_id, _item in self.ecs.entities_with(Item):
+            position = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            if position is None or on_map is None:
                 continue
+            if (
+                on_map.kind == map_kind
+                and on_map.depth == depth
+                and position.x == x
+                and position.y == y
+            ):
+                items.append(entity_id)
+        return items
 
-            dist_x = player_position.x - position.x
-            dist_y = player_position.y - position.y
-            if abs(dist_x) + abs(dist_y) == 1:
-                self._attack(entity_id, self.player_entity)
-                continue
-
-            for dx, dy in self._chase_directions(dist_x, dist_y):
-                nx = position.x + dx
-                ny = position.y + dy
-                if not self.current_map.is_passable(nx, ny):
-                    continue
-                blocker = self._blocking_entity_at(nx, ny, self.current_map.kind, entity_id)
-                if blocker is None:
-                    position.x = nx
-                    position.y = ny
-                    break
-
-    def _chase_directions(self, dist_x: int, dist_y: int) -> list[tuple[int, int]]:
-        step_x = 0 if dist_x == 0 else (1 if dist_x > 0 else -1)
-        step_y = 0 if dist_y == 0 else (1 if dist_y > 0 else -1)
-
-        if abs(dist_x) >= abs(dist_y):
-            return [(step_x, 0), (0, step_y)]
-        return [(0, step_y), (step_x, 0)]
-
-    def _attack(self, attacker: int, defender: int) -> None:
-        attacker_fighter = self.ecs.get_component(attacker, Fighter)
-        defender_fighter = self.ecs.get_component(defender, Fighter)
-        if attacker_fighter is None or defender_fighter is None:
-            return
-
-        damage = max(1, attacker_fighter.power - defender_fighter.defense)
-        defender_fighter.hp -= damage
-
-        if attacker == self.player_entity:
-            monster = self.ecs.get_component(defender, Monster)
-            target_name = monster.name if monster is not None else "target"
-            self.add_message(f"You hit {target_name} for {damage} damage.")
-        elif defender == self.player_entity:
-            monster = self.ecs.get_component(attacker, Monster)
-            source_name = monster.name if monster is not None else "enemy"
-            self.add_message(f"{source_name} hits you for {damage} damage.")
-
-        if defender_fighter.hp <= 0:
-            self._handle_death(defender)
+    def destroy_item(self, item_entity: int) -> None:
+        self.ecs.remove_component(item_entity, Item)
+        self.ecs.remove_component(item_entity, Consumable)
+        self.ecs.remove_component(item_entity, Equippable)
+        self.ecs.remove_component(item_entity, Food)
+        self.ecs.remove_component(item_entity, Position)
+        self.ecs.remove_component(item_entity, OnMap)
 
     def _handle_death(self, entity_id: int) -> None:
         if entity_id == self.player_entity:
@@ -291,315 +284,7 @@ class GameSession:
         self.kill_count += 1
         self.add_message(f"{name} dies.")
 
-    def _blocking_entity_at(
-        self,
-        x: int,
-        y: int,
-        map_kind: MapKind,
-        excluded_entity: int,
-    ) -> int | None:
-        for entity_id, _blocker in self.ecs.entities_with(BlocksMovement):
-            if entity_id == excluded_entity:
-                continue
-            position = self.ecs.get_component(entity_id, Position)
-            on_map = self.ecs.get_component(entity_id, OnMap)
-            if position is None or on_map is None:
-                continue
-            if on_map.kind == map_kind and position.x == x and position.y == y:
-                return entity_id
-        return None
-
-    def _items_at(self, map_kind: MapKind, x: int, y: int) -> list[int]:
-        items: list[int] = []
-        for entity_id, _item in self.ecs.entities_with(Item):
-            position = self.ecs.get_component(entity_id, Position)
-            on_map = self.ecs.get_component(entity_id, OnMap)
-            if position is None or on_map is None:
-                continue
-            if on_map.kind == map_kind and position.x == x and position.y == y:
-                items.append(entity_id)
-        return items
-
-    def _destroy_item(self, item_entity: int) -> None:
-        self.ecs.remove_component(item_entity, Item)
-        self.ecs.remove_component(item_entity, Consumable)
-        self.ecs.remove_component(item_entity, Position)
-        self.ecs.remove_component(item_entity, OnMap)
-
-    def _spawn_initial_content(self) -> None:
-        self._spawn_item(MapKind.OVERWORLD, 4, 2, "healing herb", heal_amount=4)
-        self._spawn_monster(MapKind.DUNGEON, 8, 5, "giant rat", hp=8, power=3, defense=0)
-        self._spawn_monster(MapKind.DUNGEON, 12, 10, "goblin", hp=12, power=4, defense=1)
-        self._spawn_item(MapKind.DUNGEON, 6, 5, "small healing potion", heal_amount=6)
-        self._spawn_item(MapKind.DUNGEON, 14, 8, "small healing potion", heal_amount=6)
-
-    def _spawn_monster(
-        self,
-        map_kind: MapKind,
-        x: int,
-        y: int,
-        name: str,
-        hp: int,
-        power: int,
-        defense: int,
-    ) -> None:
-        entity_id = self.ecs.create_entity()
-        self.ecs.add_component(entity_id, Monster(name=name))
-        self.ecs.add_component(entity_id, Fighter(max_hp=hp, hp=hp, power=power, defense=defense))
-        self.ecs.add_component(entity_id, Position(x, y))
-        self.ecs.add_component(entity_id, OnMap(map_kind))
-        self.ecs.add_component(entity_id, BlocksMovement())
-
-    def _spawn_item(self, map_kind: MapKind, x: int, y: int, name: str, heal_amount: int) -> None:
-        entity_id = self.ecs.create_entity()
-        self.ecs.add_component(entity_id, Item(name=name))
-        self.ecs.add_component(entity_id, Consumable(heal_amount=heal_amount))
-        self.ecs.add_component(entity_id, Position(x, y))
-        self.ecs.add_component(entity_id, OnMap(map_kind))
-
-    def monster_positions(self) -> list[tuple[int, int]]:
-        positions: list[tuple[int, int]] = []
-        for entity_id, _monster in self.ecs.entities_with(Monster):
-            position = self.ecs.get_component(entity_id, Position)
-            on_map = self.ecs.get_component(entity_id, OnMap)
-            if position is None or on_map is None:
-                continue
-            if on_map.kind == self.current_map.kind:
-                positions.append((position.x, position.y))
-        return positions
-
-    def item_positions(self) -> list[tuple[int, int]]:
-        positions: list[tuple[int, int]] = []
-        for entity_id, _item in self.ecs.entities_with(Item):
-            position = self.ecs.get_component(entity_id, Position)
-            on_map = self.ecs.get_component(entity_id, OnMap)
-            if position is None or on_map is None:
-                continue
-            if on_map.kind == self.current_map.kind:
-                positions.append((position.x, position.y))
-        return positions
-
-    def inventory_names(self) -> list[str]:
-        names: list[str] = []
-        for item_id in self.player_inventory.item_ids:
-            item = self.ecs.get_component(item_id, Item)
-            if item is not None:
-                names.append(item.name)
-        return names
-
-    def to_save_data(self) -> dict[str, object]:
-        """Serialize the session into a JSON-friendly dictionary."""
-        entities: list[dict[str, object]] = []
-        for entity_id in self._serializable_entity_ids():
-            entity_data: dict[str, object] = {"id": entity_id}
-
-            if self.ecs.get_component(entity_id, Player) is not None:
-                entity_data["player"] = True
-
-            monster = self.ecs.get_component(entity_id, Monster)
-            if monster is not None:
-                entity_data["monster_name"] = monster.name
-
-            position = self.ecs.get_component(entity_id, Position)
-            if position is not None:
-                entity_data["position"] = {"x": position.x, "y": position.y}
-
-            on_map = self.ecs.get_component(entity_id, OnMap)
-            if on_map is not None:
-                entity_data["map_kind"] = on_map.kind.value
-
-            if self.ecs.get_component(entity_id, BlocksMovement) is not None:
-                entity_data["blocks_movement"] = True
-
-            fighter = self.ecs.get_component(entity_id, Fighter)
-            if fighter is not None:
-                entity_data["fighter"] = {
-                    "max_hp": fighter.max_hp,
-                    "hp": fighter.hp,
-                    "power": fighter.power,
-                    "defense": fighter.defense,
-                }
-
-            inventory = self.ecs.get_component(entity_id, Inventory)
-            if inventory is not None:
-                entity_data["inventory"] = {
-                    "capacity": inventory.capacity,
-                    "item_ids": [*inventory.item_ids],
-                }
-
-            item = self.ecs.get_component(entity_id, Item)
-            if item is not None:
-                entity_data["item_name"] = item.name
-
-            consumable = self.ecs.get_component(entity_id, Consumable)
-            if consumable is not None:
-                entity_data["consumable"] = {"heal_amount": consumable.heal_amount}
-
-            entities.append(entity_data)
-
-        return {
-            "version": 1,
-            "current_map": self.current_map.kind.value,
-            "messages": [*self.messages],
-            "game_over": self.game_over,
-            "turn_count": self.turn_count,
-            "kill_count": self.kill_count,
-            "entities": entities,
-        }
-
-    def save_to_file(self, file_path: str) -> None:
-        """Persist the current run to disk as compact JSON."""
-        path = Path(file_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(self.to_save_data(), separators=(",", ":"))
-        path.write_text(payload, encoding="utf-8")
-
-    @classmethod
-    def load_from_file(cls, file_path: str) -> "GameSession":
-        """Load a saved run from disk."""
-        path = Path(file_path)
-        raw_data = json.loads(path.read_text(encoding="utf-8"))
-        return cls.from_save_data(raw_data)
-
-    @classmethod
-    def from_save_data(cls, raw_data: object) -> "GameSession":
-        """Rehydrate a game session from validated save data."""
-        data = _expect_dict(raw_data, "save_data")
-
-        session = cls()
-        session.ecs = ECSStore()
-        session._action_queue = deque()
-
-        session.messages = _expect_str_list(data.get("messages", []), "messages")
-        if not session.messages:
-            session.messages = ["Loaded save."]
-
-        session.game_over = _expect_bool(data.get("game_over", False), "game_over")
-        session.turn_count = _expect_int(data.get("turn_count", 0), "turn_count")
-        session.kill_count = _expect_int(data.get("kill_count", 0), "kill_count")
-        current_map_kind = MapKind(_expect_str(data.get("current_map"), "current_map"))
-
-        entities = _expect_list(data.get("entities", []), "entities")
-        max_entity_id = 0
-        player_entity: int | None = None
-
-        for raw_entity in entities:
-            entity_data = _expect_dict(raw_entity, "entity")
-            entity_id = _expect_int(entity_data.get("id"), "entity.id")
-            max_entity_id = max(max_entity_id, entity_id)
-
-            # Rehydrate each supported component independently so save schema can evolve
-            # without requiring rigid object snapshots.
-
-            if _expect_bool(entity_data.get("player", False), "entity.player"):
-                session.ecs.add_component(entity_id, Player())
-                player_entity = entity_id
-
-            monster_name = entity_data.get("monster_name")
-            if monster_name is not None:
-                session.ecs.add_component(
-                    entity_id,
-                    Monster(name=_expect_str(monster_name, "entity.monster_name")),
-                )
-
-            raw_position = entity_data.get("position")
-            if raw_position is not None:
-                position_data = _expect_dict(raw_position, "entity.position")
-                session.ecs.add_component(
-                    entity_id,
-                    Position(
-                        x=_expect_int(position_data.get("x"), "entity.position.x"),
-                        y=_expect_int(position_data.get("y"), "entity.position.y"),
-                    ),
-                )
-
-            map_kind_value = entity_data.get("map_kind")
-            if map_kind_value is not None:
-                session.ecs.add_component(
-                    entity_id,
-                    OnMap(kind=MapKind(_expect_str(map_kind_value, "entity.map_kind"))),
-                )
-
-            if _expect_bool(entity_data.get("blocks_movement", False), "entity.blocks_movement"):
-                session.ecs.add_component(entity_id, BlocksMovement())
-
-            raw_fighter = entity_data.get("fighter")
-            if raw_fighter is not None:
-                fighter_data = _expect_dict(raw_fighter, "entity.fighter")
-                session.ecs.add_component(
-                    entity_id,
-                    Fighter(
-                        max_hp=_expect_int(fighter_data.get("max_hp"), "entity.fighter.max_hp"),
-                        hp=_expect_int(fighter_data.get("hp"), "entity.fighter.hp"),
-                        power=_expect_int(fighter_data.get("power"), "entity.fighter.power"),
-                        defense=_expect_int(
-                            fighter_data.get("defense"),
-                            "entity.fighter.defense",
-                        ),
-                    ),
-                )
-
-            raw_inventory = entity_data.get("inventory")
-            if raw_inventory is not None:
-                inventory_data = _expect_dict(raw_inventory, "entity.inventory")
-                session.ecs.add_component(
-                    entity_id,
-                    Inventory(
-                        capacity=_expect_int(
-                            inventory_data.get("capacity"),
-                            "entity.inventory.capacity",
-                        ),
-                        item_ids=_expect_int_list(
-                            inventory_data.get("item_ids", []),
-                            "entity.inventory.item_ids",
-                        ),
-                    ),
-                )
-
-            item_name = entity_data.get("item_name")
-            if item_name is not None:
-                session.ecs.add_component(
-                    entity_id,
-                    Item(name=_expect_str(item_name, "entity.item_name")),
-                )
-
-            raw_consumable = entity_data.get("consumable")
-            if raw_consumable is not None:
-                consumable_data = _expect_dict(raw_consumable, "entity.consumable")
-                session.ecs.add_component(
-                    entity_id,
-                    Consumable(
-                        heal_amount=_expect_int(
-                            consumable_data.get("heal_amount"),
-                            "entity.consumable.heal_amount",
-                        ),
-                    ),
-                )
-
-        if player_entity is None:
-            msg = "Save data is missing player entity."
-            raise ValueError(msg)
-
-        session.player_entity = player_entity
-        session.ecs.set_next_entity_id(max_entity_id + 1)
-        session.current_map = (
-            session.overworld if current_map_kind == MapKind.OVERWORLD else session.dungeon
-        )
-
-        player_map = session.ecs.get_component(session.player_entity, OnMap)
-        if player_map is None:
-            session.ecs.add_component(session.player_entity, OnMap(current_map_kind))
-        else:
-            player_map.kind = current_map_kind
-
-        _ = session.player_position
-        _ = session.player_fighter
-        _ = session.player_inventory
-        _ = session.player_map
-        return session
-
-    def _serializable_entity_ids(self) -> list[int]:
-        """Collect all entity IDs that carry persisted gameplay components."""
+    def serializable_entity_ids(self) -> list[int]:
         entity_ids = {self.player_entity}
         component_types: tuple[type[object], ...] = (
             Player,
@@ -611,11 +296,239 @@ class GameSession:
             Inventory,
             Item,
             Consumable,
+            Equippable,
+            Equipment,
+            Food,
+            Hunger,
         )
         for component_type in component_types:
             for entity_id, _ in self.ecs.entities_with(component_type):
                 entity_ids.add(entity_id)
         return sorted(entity_ids)
+
+    def to_save_data(self) -> dict[str, object]:
+        return self.persistence_system.to_save_data(self)
+
+    def save_to_file(self, file_path: str) -> None:
+        self.persistence_system.save_to_file(self, file_path)
+
+    @classmethod
+    def load_from_file(cls, file_path: str) -> "GameSession":
+        return PersistenceSystem().load_from_file(file_path)
+
+    @classmethod
+    def from_save_data(cls, raw_data: object) -> "GameSession":
+        return PersistenceSystem().from_save_data(raw_data)
+
+    def monster_positions(self) -> list[tuple[int, int]]:
+        positions: list[tuple[int, int]] = []
+        for entity_id, _monster in self.ecs.entities_with(Monster):
+            position = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            if position is None or on_map is None:
+                continue
+            if on_map.kind == self.current_map.kind and on_map.depth == self.current_depth:
+                positions.append((position.x, position.y))
+        return positions
+
+    def item_positions(self) -> list[tuple[int, int]]:
+        positions: list[tuple[int, int]] = []
+        for entity_id, _item in self.ecs.entities_with(Item):
+            position = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            if position is None or on_map is None:
+                continue
+            if on_map.kind == self.current_map.kind and on_map.depth == self.current_depth:
+                positions.append((position.x, position.y))
+        return positions
+
+    def inventory_names(self) -> list[str]:
+        names: list[str] = []
+        equipment = self.player_equipment
+        for item_id in self.player_inventory.item_ids:
+            item = self.ecs.get_component(item_id, Item)
+            if item is None:
+                continue
+            suffix = ""
+            if equipment.weapon_item_id == item_id:
+                suffix = " (wielded)"
+            if equipment.armor_item_id == item_id:
+                suffix = " (worn)"
+            names.append(f"{item.name}{suffix}")
+        return names
+
+    def map_for_depth(self, depth: int | None) -> TileMap:
+        if depth is None:
+            return self.overworld
+        clamped = max(1, min(depth, self.dungeon_level_count))
+        return self.dungeon_levels[clamped - 1]
+
+    @staticmethod
+    def available_races() -> tuple[RaceDefinition, ...]:
+        races, _ = load_character_content()
+        return races
+
+    @staticmethod
+    def available_classes() -> tuple[ClassDefinition, ...]:
+        _, classes = load_character_content()
+        return classes
+
+    @classmethod
+    def available_character_options(
+        cls,
+    ) -> tuple[tuple[RaceDefinition, ...], tuple[ClassDefinition, ...]]:
+        return load_character_content()
+
+    def _spawn_player(self) -> None:
+        fighter = Fighter(
+            max_hp=max(1, self.character_class.base_hp + self.race.hp_bonus),
+            hp=max(1, self.character_class.base_hp + self.race.hp_bonus),
+            power=max(1, self.character_class.base_power + self.race.power_bonus),
+            defense=max(0, self.character_class.base_defense + self.race.defense_bonus),
+        )
+
+        self.ecs.add_component(self.player_entity, Player())
+        self.ecs.add_component(self.player_entity, Position(2, 2))
+        self.ecs.add_component(self.player_entity, OnMap(MapKind.OVERWORLD, depth=None))
+        self.ecs.add_component(self.player_entity, BlocksMovement())
+        self.ecs.add_component(self.player_entity, fighter)
+        self.ecs.add_component(self.player_entity, Inventory(capacity=12))
+        self.ecs.add_component(self.player_entity, Equipment())
+        self.ecs.add_component(
+            self.player_entity,
+            Hunger(current=self.race.hunger_max, max_value=self.race.hunger_max),
+        )
+
+    def _spawn_world_content(self) -> None:
+        self._spawn_item_rules(self.spawn_content.overworld_items, MapKind.OVERWORLD, depth=None)
+
+        for depth in range(1, self.dungeon_level_count + 1):
+            self._spawn_item_rules(self.spawn_content.dungeon_items, MapKind.DUNGEON, depth=depth)
+            self._spawn_monster_rules(self.spawn_content.dungeon_monsters, depth=depth)
+
+    def _spawn_item_rules(
+        self,
+        rules: tuple[SpawnRule, ...],
+        map_kind: MapKind,
+        depth: int | None,
+    ) -> None:
+        for rule in rules:
+            template = self.spawn_content.item_templates.get(rule.template_id)
+            if template is None:
+                continue
+            for _ in range(rule.count):
+                pos = self._random_spawn_position(map_kind, depth)
+                if pos is None:
+                    continue
+                self._spawn_item_on_map(template, map_kind, depth, pos[0], pos[1])
+
+    def _spawn_monster_rules(self, rules: tuple[SpawnRule, ...], depth: int) -> None:
+        for rule in rules:
+            template = self.spawn_content.monster_templates.get(rule.template_id)
+            if template is None:
+                continue
+            for _ in range(rule.count):
+                pos = self._random_spawn_position(MapKind.DUNGEON, depth)
+                if pos is None:
+                    continue
+                self._spawn_monster(template, depth, pos[0], pos[1])
+
+    def _random_spawn_position(
+        self,
+        map_kind: MapKind,
+        depth: int | None,
+    ) -> tuple[int, int] | None:
+        tile_map = self.overworld if map_kind == MapKind.OVERWORLD else self.map_for_depth(depth)
+        candidates: list[tuple[int, int]] = []
+        for y in range(1, tile_map.height - 1):
+            for x in range(1, tile_map.width - 1):
+                if not tile_map.is_passable(x, y):
+                    continue
+                if map_kind == MapKind.OVERWORLD and tile_map.entrance_pos == (x, y):
+                    continue
+                if map_kind == MapKind.DUNGEON and (
+                    tile_map.exit_pos == (x, y) or tile_map.stairs_down_pos == (x, y)
+                ):
+                    continue
+
+                blocked = self.blocking_entity_at(x, y, map_kind, depth, excluded_entity=-1)
+                if blocked is not None:
+                    continue
+                if self.items_at(map_kind, depth, x, y):
+                    continue
+                candidates.append((x, y))
+
+        if not candidates:
+            return None
+        return self.rng.choice(candidates)
+
+    def _spawn_monster(self, template: MonsterTemplate, depth: int, x: int, y: int) -> None:
+        entity_id = self.ecs.create_entity()
+        self.ecs.add_component(entity_id, Monster(name=template.name))
+        self.ecs.add_component(
+            entity_id,
+            Fighter(
+                max_hp=template.hp,
+                hp=template.hp,
+                power=template.power,
+                defense=template.defense,
+            ),
+        )
+        self.ecs.add_component(entity_id, Position(x, y))
+        self.ecs.add_component(entity_id, OnMap(MapKind.DUNGEON, depth=depth))
+        self.ecs.add_component(entity_id, BlocksMovement())
+
+    def _spawn_item_on_map(
+        self,
+        template: ItemTemplate,
+        map_kind: MapKind,
+        depth: int | None,
+        x: int,
+        y: int,
+    ) -> int:
+        entity_id = self._create_item_entity(template)
+        self.ecs.add_component(entity_id, Position(x, y))
+        self.ecs.add_component(entity_id, OnMap(map_kind, depth=depth))
+        return entity_id
+
+    def _create_item_entity(self, template: ItemTemplate) -> int:
+        entity_id = self.ecs.create_entity()
+        self.ecs.add_component(entity_id, Item(name=template.name))
+        if template.heal_amount is not None:
+            self.ecs.add_component(entity_id, Consumable(heal_amount=template.heal_amount))
+        if template.nutrition is not None:
+            self.ecs.add_component(entity_id, Food(nutrition=template.nutrition))
+        if template.equip_slot is not None:
+            self.ecs.add_component(
+                entity_id,
+                Equippable(
+                    slot=template.equip_slot,
+                    power_bonus=template.power_bonus,
+                    defense_bonus=template.defense_bonus,
+                ),
+            )
+        return entity_id
+
+    def _grant_starting_loadout(self) -> None:
+        inventory = self.player_inventory
+        equipment = self.player_equipment
+
+        for template_id in self.character_class.starting_items:
+            template = self.spawn_content.item_templates.get(template_id)
+            if template is None:
+                continue
+
+            entity_id = self._create_item_entity(template)
+            inventory.item_ids.append(entity_id)
+
+            equippable = self.ecs.get_component(entity_id, Equippable)
+            if equippable is None:
+                continue
+
+            if equippable.slot == EquipmentSlot.WEAPON and equipment.weapon_item_id is None:
+                equipment.weapon_item_id = entity_id
+            if equippable.slot == EquipmentSlot.ARMOR and equipment.armor_item_id is None:
+                equipment.armor_item_id = entity_id
 
     def _handle_transition_if_needed(self) -> None:
         position = self.player_position
@@ -623,67 +536,90 @@ class GameSession:
 
         if self.current_map.kind == MapKind.OVERWORLD and self.overworld.entrance_pos is not None:
             if (position.x, position.y) == self.overworld.entrance_pos:
-                self.current_map = self.dungeon
+                target = self.dungeon_levels[0]
+                target_pos = self._adjacent_open_tile(target, target.exit_pos)
+                self.current_map = target
+                self.current_depth = target.depth
                 on_map.kind = MapKind.DUNGEON
-                position.x, position.y = (5, 5)
-                self.add_message("You descend into the dungeon.")
+                on_map.depth = target.depth
+                position.x, position.y = target_pos
+                self.add_message("You descend into dungeon level 1.")
                 return
 
-        if self.current_map.kind == MapKind.DUNGEON and self.dungeon.exit_pos is not None:
-            if (position.x, position.y) == self.dungeon.exit_pos:
-                self.current_map = self.overworld
-                on_map.kind = MapKind.OVERWORLD
-                ox, oy = self.overworld.entrance_pos or (2, 2)
-                position.x, position.y = (ox, oy + 1)
-                self.add_message("You return to the overworld.")
+        if self.current_map.kind == MapKind.DUNGEON:
+            depth = self.current_depth or 1
+
+            if self.current_map.stairs_down_pos is not None:
+                if (
+                    (position.x, position.y) == self.current_map.stairs_down_pos
+                    and depth < self.dungeon_level_count
+                ):
+                    target = self.map_for_depth(depth + 1)
+                    target_pos = self._adjacent_open_tile(target, target.exit_pos)
+                    self.current_map = target
+                    self.current_depth = target.depth
+                    on_map.kind = MapKind.DUNGEON
+                    on_map.depth = target.depth
+                    position.x, position.y = target_pos
+                    self.add_message(f"You descend to dungeon level {target.depth}.")
+                    return
+
+            if (
+                self.current_map.exit_pos is not None
+                and (position.x, position.y) == self.current_map.exit_pos
+            ):
+                if depth == 1:
+                    self.current_map = self.overworld
+                    self.current_depth = None
+                    on_map.kind = MapKind.OVERWORLD
+                    on_map.depth = None
+                    ox, oy = self.overworld.entrance_pos or (2, 2)
+                    position.x, position.y = (ox, oy + 1)
+                    self.add_message("You return to the overworld.")
+                    return
+
+                target = self.map_for_depth(depth - 1)
+                target_pos = self._adjacent_open_tile(target, target.stairs_down_pos)
+                self.current_map = target
+                self.current_depth = target.depth
+                on_map.kind = MapKind.DUNGEON
+                on_map.depth = target.depth
+                position.x, position.y = target_pos
+                self.add_message(f"You ascend to dungeon level {target.depth}.")
+
+    def _adjacent_open_tile(
+        self,
+        tile_map: TileMap,
+        anchor: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        if anchor is None:
+            return (2, 2)
+
+        ax, ay = anchor
+        candidates = [
+            (ax + 1, ay),
+            (ax - 1, ay),
+            (ax, ay + 1),
+            (ax, ay - 1),
+            (ax, ay),
+        ]
+        for x, y in candidates:
+            if tile_map.is_passable(x, y):
+                return (x, y)
+        return anchor
 
 
-def _expect_dict(value: object, field_name: str) -> dict[str, object]:
-    if not isinstance(value, dict):
-        msg = f"{field_name} must be an object."
-        raise ValueError(msg)
-    return cast(dict[str, object], value)
+def _find_race(races: tuple[RaceDefinition, ...], race_id: str) -> RaceDefinition:
+    for race in races:
+        if race.id == race_id:
+            return race
+    msg = f"Unknown race: {race_id}"
+    raise ValueError(msg)
 
 
-def _expect_list(value: object, field_name: str) -> list[object]:
-    if not isinstance(value, list):
-        msg = f"{field_name} must be an array."
-        raise ValueError(msg)
-    return value
-
-
-def _expect_str(value: object, field_name: str) -> str:
-    if not isinstance(value, str):
-        msg = f"{field_name} must be a string."
-        raise ValueError(msg)
-    return value
-
-
-def _expect_int(value: object, field_name: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        msg = f"{field_name} must be an integer."
-        raise ValueError(msg)
-    return value
-
-
-def _expect_bool(value: object, field_name: str) -> bool:
-    if not isinstance(value, bool):
-        msg = f"{field_name} must be a boolean."
-        raise ValueError(msg)
-    return value
-
-
-def _expect_str_list(value: object, field_name: str) -> list[str]:
-    raw_list = _expect_list(value, field_name)
-    result: list[str] = []
-    for idx, item in enumerate(raw_list):
-        result.append(_expect_str(item, f"{field_name}[{idx}]"))
-    return result
-
-
-def _expect_int_list(value: object, field_name: str) -> list[int]:
-    raw_list = _expect_list(value, field_name)
-    result: list[int] = []
-    for idx, item in enumerate(raw_list):
-        result.append(_expect_int(item, f"{field_name}[{idx}]"))
-    return result
+def _find_class(classes: tuple[ClassDefinition, ...], class_id: str) -> ClassDefinition:
+    for class_def in classes:
+        if class_def.id == class_id:
+            return class_def
+    msg = f"Unknown class: {class_id}"
+    raise ValueError(msg)

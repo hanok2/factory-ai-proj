@@ -205,18 +205,27 @@ This document defines a requirements-oriented backlog for evolving the current r
 
 ## 6. Immediate Next Sprint (Concrete TODO Cut)
 
-1. [ ] Refactor `GameSession` into `TurnSystem`, `CombatSystem`, `InventorySystem`, `AISystem`, `PersistenceSystem`.
-2. [ ] Introduce equipment slots and basic equippable weapons/armor.
-3. [ ] Add dungeon depth array (`dungeon_1..dungeon_n`) and staircase transitions.
-4. [ ] Add hunger timer and food consumables.
-5. [ ] Convert monster/item spawn definitions to external content data files.
-6. [ ] Add deterministic seed selection and include seed in save metadata.
-7. [ ] Add a character creation screen (race/class + starting loadout).
+1. [x] Refactor `GameSession` into `TurnSystem`, `CombatSystem`, `InventorySystem`, `AISystem`, `PersistenceSystem`.
+2. [x] Introduce equipment slots and basic equippable weapons/armor.
+3. [x] Add dungeon depth array (`dungeon_1..dungeon_n`) and staircase transitions.
+4. [x] Add hunger timer and food consumables.
+5. [x] Convert monster/item spawn definitions to external content data files.
+6. [x] Add deterministic seed selection and include seed in save metadata.
+7. [x] Add a character creation screen (race/class + starting loadout).
+
+### Current parity state for this sprint
+- Implemented at **baseline parity**: systems split, depth transitions, hunger loop, equipment slots, seed-driven content spawn, save metadata, and character creation UI.
+- Still missing for ADOM-level parity: advanced skill/talent progression, corruption/piety, broad quest/faction simulation, deeper procgen variety, and large content scale.
 
 ## 7. Gap Snapshot vs Current Build
 
 ### Implemented now
-- Overworld + single dungeon, turn loop, melee combat, basic inventory, save/load, pygame HUD.
+- Overworld + multi-depth dungeon array, turn loop systems split, melee combat, inventory/use/equip/eat actions.
+- Equipment slots (weapon/armor) with effective stat bonuses.
+- Hunger timer with food consumables.
+- Externalized spawn + character definitions in content JSON files.
+- Deterministic seed selection and save metadata (`seed`, race/class IDs, dungeon depth context).
+- Character creation screen with race/class selection and starting loadout.
 
 ### Missing for ADOM-like depth
 - character generation and long-run progression,
