@@ -29,3 +29,19 @@ class DropLastItemAction(GameAction):
 @dataclass(slots=True)
 class WaitAction(GameAction):
     pass
+
+
+@dataclass(slots=True)
+class RestAction(GameAction):
+    pass
+
+
+@dataclass(slots=True)
+class DisarmTrapAction(GameAction):
+    pass
+
+
+@dataclass(slots=True)
+class RangedAttackAction(GameAction):
+    dx: int
+    dy: int

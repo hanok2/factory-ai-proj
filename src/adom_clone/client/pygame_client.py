@@ -6,10 +6,13 @@ from collections.abc import Iterable
 import pygame
 
 from adom_clone.core.game.actions import (
+    DisarmTrapAction,
     DropLastItemAction,
     GameAction,
     MoveAction,
     PickupAction,
+    RangedAttackAction,
+    RestAction,
     UseItemAction,
     WaitAction,
 )
@@ -20,6 +23,7 @@ HUD_HEIGHT = 140
 PLAYER_COLOR = (245, 220, 90)
 MONSTER_COLOR = (180, 60, 60)
 ITEM_COLOR = (90, 200, 220)
+TRAP_COLOR = (205, 80, 205)
 TEXT_COLOR = (230, 230, 230)
 BACKGROUND = (10, 10, 12)
 DEFAULT_SAVE_FILE = "savegame.json"
@@ -45,13 +49,38 @@ def run_game() -> None:
     font = pygame.font.SysFont("monospace", 18)
 
     running = True
+    targeting_mode = False
+    show_sheet = False
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
+                    if targeting_mode:
+                        targeting_mode = False
+                        session.add_message("Targeting cancelled.")
+                        continue
+                    if show_sheet:
+                        show_sheet = False
+                        continue
                     running = False
+
+                if event.key == pygame.K_c:
+                    show_sheet = not show_sheet
+                    continue
+
+                if targeting_mode:
+                    maybe_ranged = _ranged_action_for_key(event.key)
+                    if maybe_ranged is not None:
+                        session.queue_action(maybe_ranged)
+                        targeting_mode = False
+                    continue
+
+                if event.key == pygame.K_f:
+                    targeting_mode = True
+                    session.add_message("Targeting mode: choose a direction.")
+                    continue
 
                 if event.key == pygame.K_F5:
                     # Save/load hotkeys are kept in the client to avoid coupling UI concerns
@@ -86,14 +115,20 @@ def run_game() -> None:
                     session.queue_action(maybe_action)
 
         session.advance_turn()
-        _draw(screen, font, session)
+        _draw(screen, font, session, show_sheet, targeting_mode)
         pygame.display.flip()
         clock.tick(60)
 
     pygame.quit()
 
 
-def _draw(screen: pygame.Surface, font: pygame.font.Font, session: GameSession) -> None:
+def _draw(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    session: GameSession,
+    show_sheet: bool,
+    targeting_mode: bool,
+) -> None:
     """Draw map tiles, entities, and HUD."""
     screen.fill(BACKGROUND)
     tile_map = session.current_map
@@ -112,6 +147,15 @@ def _draw(screen: pygame.Surface, font: pygame.font.Font, session: GameSession) 
             TILE_SIZE // 2,
         )
         pygame.draw.rect(screen, ITEM_COLOR, item_rect)
+
+    for x, y in session.trap_positions():
+        trap_rect = pygame.Rect(
+            x * TILE_SIZE + TILE_SIZE // 4,
+            y * TILE_SIZE + TILE_SIZE // 4,
+            TILE_SIZE // 2,
+            TILE_SIZE // 2,
+        )
+        pygame.draw.rect(screen, TRAP_COLOR, trap_rect, width=2)
 
     for x, y in session.monster_positions():
         monster_rect = pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
@@ -134,15 +178,23 @@ def _draw(screen: pygame.Surface, font: pygame.font.Font, session: GameSession) 
     )
     stats_line = (
         f"Power: {session.player_power} | Defense: {session.player_defense} "
-        f"| Turns: {session.turn_count} | Kills: {session.kill_count}"
+        f"| {session.player_level_text} | Turns: {session.turn_count} | Kills: {session.kill_count}"
     )
-    controls_line = "Move: WASD/Arrows | G:pickup | 1-9:use/equip/eat | R:drop | .:wait | N:new"
+    controls_line = (
+        "Move: WASD/Arrows | G:pickup | 1-9:use/equip/eat | "
+        "F:target | V:rest | X:disarm | R:drop | C:sheet"
+    )
     save_line = "F5: save | F9: load | ESC: quit"
     inventory_line = _inventory_line(session)
     lines = [map_line, stats_line, controls_line, save_line, inventory_line, *session.messages[-2:]]
+    if targeting_mode:
+        lines.append("Targeting mode active: press a movement direction to throw.")
     if session.game_over:
         lines.append("Game over. Press ESC to quit.")
     _blit_lines(screen, font, lines, hud_y + 8)
+
+    if show_sheet:
+        _draw_character_sheet(screen, font, session)
 
 
 def _inventory_line(session: GameSession) -> str:
@@ -179,6 +231,10 @@ def _action_for_key(key: int) -> GameAction | None:
         return MoveAction(1, 0)
     if key == pygame.K_g:
         return PickupAction()
+    if key == pygame.K_v:
+        return RestAction()
+    if key == pygame.K_x:
+        return DisarmTrapAction()
     if key == pygame.K_r:
         return DropLastItemAction()
     if key in (pygame.K_PERIOD, pygame.K_SPACE):
@@ -186,6 +242,53 @@ def _action_for_key(key: int) -> GameAction | None:
     if pygame.K_1 <= key <= pygame.K_9:
         return UseItemAction(key - pygame.K_1)
     return None
+
+
+def _ranged_action_for_key(key: int) -> RangedAttackAction | None:
+    if key in (pygame.K_w, pygame.K_UP):
+        return RangedAttackAction(0, -1)
+    if key in (pygame.K_s, pygame.K_DOWN):
+        return RangedAttackAction(0, 1)
+    if key in (pygame.K_a, pygame.K_LEFT):
+        return RangedAttackAction(-1, 0)
+    if key in (pygame.K_d, pygame.K_RIGHT):
+        return RangedAttackAction(1, 0)
+    return None
+
+
+def _draw_character_sheet(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    session: GameSession,
+) -> None:
+    panel = pygame.Rect(40, 40, screen.get_width() - 80, screen.get_height() - 80)
+    pygame.draw.rect(screen, (8, 8, 12), panel)
+    pygame.draw.rect(screen, (220, 220, 230), panel, width=2)
+
+    equipment = session.player_equipment
+    inv_names = session.inventory_names()
+    weapon_name = "none"
+    armor_name = "none"
+    if equipment.weapon_item_id is not None:
+        weapon_name = next((name for name in inv_names if "(wielded)" in name), "equipped")
+    if equipment.armor_item_id is not None:
+        armor_name = next((name for name in inv_names if "(worn)" in name), "equipped")
+
+    lines = [
+        "Character Sheet (C to close)",
+        f"Race: {session.race.name}",
+        f"Class: {session.character_class.name}",
+        f"Seed: {session.seed}",
+        f"{session.player_level_text}",
+        f"HP: {session.player_hp_text}",
+        f"Hunger: {session.player_hunger_text}",
+        f"Power: {session.player_power}",
+        f"Defense: {session.player_defense}",
+        f"Weapon: {weapon_name}",
+        f"Armor: {armor_name}",
+        f"Turns: {session.turn_count} | Kills: {session.kill_count}",
+    ]
+    _blit_lines(screen, font, lines, panel.y + 12)
 
 
 def _character_creation_screen(screen: pygame.Surface) -> "CharacterSelection":

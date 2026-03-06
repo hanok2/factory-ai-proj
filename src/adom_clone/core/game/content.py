@@ -26,6 +26,10 @@ class ClassDefinition:
     base_power: int
     base_defense: int
     starting_items: tuple[str, ...]
+    xp_base: int
+    hp_per_level: int
+    power_every: int
+    defense_every: int
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,8 @@ class ItemTemplate:
     equip_slot: EquipmentSlot | None
     power_bonus: int
     defense_bonus: int
+    ranged_damage: int | None
+    ranged_range: int | None
 
 
 @dataclass(frozen=True)
@@ -46,6 +52,7 @@ class MonsterTemplate:
     hp: int
     power: int
     defense: int
+    xp_reward: int
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,10 @@ def _parse_class(raw: object) -> ClassDefinition:
         base_power=_expect_int(data.get("base_power"), "class.base_power"),
         base_defense=_expect_int(data.get("base_defense"), "class.base_defense"),
         starting_items=starting_items,
+        xp_base=_expect_int(data.get("xp_base", 20), "class.xp_base"),
+        hp_per_level=_expect_int(data.get("hp_per_level", 2), "class.hp_per_level"),
+        power_every=_expect_int(data.get("power_every", 2), "class.power_every"),
+        defense_every=_expect_int(data.get("defense_every", 3), "class.defense_every"),
     )
 
 
@@ -155,6 +166,8 @@ def _parse_item_template(template_id: str, raw: object) -> ItemTemplate:
 
     heal_amount_raw = data.get("heal_amount")
     nutrition_raw = data.get("nutrition")
+    ranged_damage_raw = data.get("ranged_damage")
+    ranged_range_raw = data.get("ranged_range")
     return ItemTemplate(
         id=template_id,
         name=_expect_str(data.get("name"), f"item_templates.{template_id}.name"),
@@ -171,6 +184,16 @@ def _parse_item_template(template_id: str, raw: object) -> ItemTemplate:
             data.get("defense_bonus", 0),
             f"item_templates.{template_id}.defense_bonus",
         ),
+        ranged_damage=(
+            None
+            if ranged_damage_raw is None
+            else _expect_int(ranged_damage_raw, f"item_templates.{template_id}.ranged_damage")
+        ),
+        ranged_range=(
+            None
+            if ranged_range_raw is None
+            else _expect_int(ranged_range_raw, f"item_templates.{template_id}.ranged_range")
+        ),
     )
 
 
@@ -182,6 +205,10 @@ def _parse_monster_template(template_id: str, raw: object) -> MonsterTemplate:
         hp=_expect_int(data.get("hp"), f"monster_templates.{template_id}.hp"),
         power=_expect_int(data.get("power"), f"monster_templates.{template_id}.power"),
         defense=_expect_int(data.get("defense"), f"monster_templates.{template_id}.defense"),
+        xp_reward=_expect_int(
+            data.get("xp_reward", 10),
+            f"monster_templates.{template_id}.xp_reward",
+        ),
     )
 
 

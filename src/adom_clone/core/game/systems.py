@@ -11,6 +11,7 @@ from adom_clone.core.ecs.components import (
     Equipment,
     EquipmentSlot,
     Equippable,
+    ExperienceReward,
     Fighter,
     Food,
     Hunger,
@@ -20,13 +21,19 @@ from adom_clone.core.ecs.components import (
     OnMap,
     Player,
     Position,
+    Progression,
+    RangedWeapon,
+    StatusEffects,
 )
 from adom_clone.core.ecs.store import ECSStore
 from adom_clone.core.game.actions import (
+    DisarmTrapAction,
     DropLastItemAction,
     GameAction,
     MoveAction,
     PickupAction,
+    RangedAttackAction,
+    RestAction,
     UseItemAction,
     WaitAction,
 )
@@ -44,12 +51,17 @@ class TurnSystem:
             return
 
         action = session._action_queue.popleft()
-        acted = self._apply_action(session, action)
+        if session.consume_player_stun_turn():
+            acted = True
+        else:
+            acted = self._apply_action(session, action)
         if not acted:
             return
 
         session.turn_count += 1
         session.tick_hunger()
+        session.apply_status_damage(session.player_entity)
+        session.apply_natural_regen()
         if not session.game_over:
             session.ai_system.run_monster_turns(session)
 
@@ -62,6 +74,12 @@ class TurnSystem:
             return session.inventory_system.use_item(session, action.slot_index)
         if isinstance(action, DropLastItemAction):
             return session.inventory_system.drop_last_item(session)
+        if isinstance(action, RangedAttackAction):
+            return session.combat_system.ranged_attack(session, action.dx, action.dy)
+        if isinstance(action, RestAction):
+            return session.rest_player()
+        if isinstance(action, DisarmTrapAction):
+            return session.disarm_nearby_trap()
         if isinstance(action, WaitAction):
             session.add_message("You wait.")
             return True
@@ -95,6 +113,59 @@ class CombatSystem:
 
         if defender_fighter.hp <= 0:
             session._handle_death(defender)
+
+    def ranged_attack(self, session: "GameSession", dx: int, dy: int) -> bool:
+        if dx == 0 and dy == 0:
+            session.add_message("Choose a direction to fire.")
+            return False
+
+        projectile = session.first_ranged_projectile()
+        if projectile is None:
+            session.add_message("You have no ranged projectile ready.")
+            return False
+
+        slot_index, item_entity, item, ranged = projectile
+        start = session.player_position
+        for step in range(1, ranged.range + 1):
+            tx = start.x + dx * step
+            ty = start.y + dy * step
+            if not session.current_map.in_bounds(tx, ty):
+                break
+            if not session.current_map.is_passable(tx, ty):
+                break
+
+            blocker = session.blocking_entity_at(
+                tx,
+                ty,
+                session.current_map.kind,
+                session.current_depth,
+                session.player_entity,
+            )
+            if blocker is None:
+                continue
+
+            target_fighter = session.ecs.get_component(blocker, Fighter)
+            if target_fighter is None:
+                break
+
+            damage = max(
+                1,
+                self.effective_power(session, session.player_entity)
+                + ranged.damage
+                - self.effective_defense(session, blocker),
+            )
+            target_fighter.hp -= damage
+            target = session.ecs.get_component(blocker, Monster)
+            target_name = "target" if target is None else target.name
+            session.add_message(f"You throw {item.name} and hit {target_name} for {damage} damage.")
+            session.consume_inventory_item(slot_index, item_entity)
+            if target_fighter.hp <= 0:
+                session._handle_death(blocker)
+            return True
+
+        session.add_message(f"You throw {item.name}, but hit nothing.")
+        session.consume_inventory_item(slot_index, item_entity)
+        return True
 
     def effective_power(self, session: "GameSession", entity_id: int) -> int:
         fighter = session.ecs.get_component(entity_id, Fighter)
@@ -191,6 +262,10 @@ class InventorySystem:
         if equippable is not None:
             return self._toggle_equip_item(session, item_entity, item)
 
+        if session.ecs.get_component(item_entity, RangedWeapon) is not None:
+            session.add_message("Use [F] to enter targeting mode, then choose a direction.")
+            return False
+
         session.add_message("You can't use that item.")
         return False
 
@@ -265,10 +340,15 @@ class AISystem:
             if on_map.kind != session.current_map.kind or on_map.depth != session.current_depth:
                 continue
 
+            if session.consume_monster_stun_turn(entity_id):
+                session.apply_status_damage(entity_id)
+                continue
+
             dist_x = player_position.x - position.x
             dist_y = player_position.y - position.y
             if abs(dist_x) + abs(dist_y) == 1:
                 session.combat_system.attack(session, entity_id, session.player_entity)
+                session.apply_status_damage(entity_id)
                 continue
 
             for dx, dy in self._chase_directions(dist_x, dist_y):
@@ -287,6 +367,8 @@ class AISystem:
                     position.x = nx
                     position.y = ny
                     break
+
+            session.apply_status_damage(entity_id)
 
     def _chase_directions(self, dist_x: int, dist_y: int) -> list[tuple[int, int]]:
         step_x = 0 if dist_x == 0 else (1 if dist_x > 0 else -1)
@@ -333,6 +415,22 @@ class PersistenceSystem:
                     "defense": fighter.defense,
                 }
 
+            progression = session.ecs.get_component(entity_id, Progression)
+            if progression is not None:
+                entity_data["progression"] = {
+                    "level": progression.level,
+                    "xp": progression.xp,
+                    "xp_to_next": progression.xp_to_next,
+                }
+
+            status = session.ecs.get_component(entity_id, StatusEffects)
+            if status is not None:
+                entity_data["status"] = {
+                    "poison": status.poison,
+                    "bleed": status.bleed,
+                    "stun": status.stun,
+                }
+
             inventory = session.ecs.get_component(entity_id, Inventory)
             if inventory is not None:
                 entity_data["inventory"] = {
@@ -370,6 +468,17 @@ class PersistenceSystem:
                     "defense_bonus": equippable.defense_bonus,
                 }
 
+            ranged = session.ecs.get_component(entity_id, RangedWeapon)
+            if ranged is not None:
+                entity_data["ranged"] = {
+                    "damage": ranged.damage,
+                    "range": ranged.range,
+                }
+
+            reward = session.ecs.get_component(entity_id, ExperienceReward)
+            if reward is not None:
+                entity_data["xp_reward"] = reward.xp
+
             food = session.ecs.get_component(entity_id, Food)
             if food is not None:
                 entity_data["food"] = {"nutrition": food.nutrition}
@@ -377,7 +486,7 @@ class PersistenceSystem:
             entities.append(entity_data)
 
         return {
-            "version": 2,
+            "version": 3,
             "seed": session.seed,
             "race_id": session.race_id,
             "class_id": session.class_id,
@@ -388,6 +497,8 @@ class PersistenceSystem:
             "game_over": session.game_over,
             "turn_count": session.turn_count,
             "kill_count": session.kill_count,
+            "regen_counter": session.regen_counter,
+            "trap_state": _serialize_trap_state(session),
             "entities": entities,
         }
 
@@ -405,7 +516,8 @@ class PersistenceSystem:
     def from_save_data(self, raw_data: object) -> "GameSession":
         from adom_clone.core.game.session import GameSession
 
-        data = _expect_dict(raw_data, "save_data")
+        raw_dict = _expect_dict(raw_data, "save_data")
+        data = _migrate_save_data(raw_dict)
 
         seed = _expect_int(data.get("seed", 1337), "seed")
         race_id = _expect_str(data.get("race_id", "human"), "race_id")
@@ -428,6 +540,7 @@ class PersistenceSystem:
         session.game_over = _expect_bool(data.get("game_over", False), "game_over")
         session.turn_count = _expect_int(data.get("turn_count", 0), "turn_count")
         session.kill_count = _expect_int(data.get("kill_count", 0), "kill_count")
+        session.regen_counter = _expect_int(data.get("regen_counter", 0), "regen_counter")
         current_map_kind = MapKind(_expect_str(data.get("current_map"), "current_map"))
         current_depth_raw = data.get("current_depth")
         current_depth = (
@@ -435,6 +548,9 @@ class PersistenceSystem:
             if current_depth_raw is None
             else _expect_int(current_depth_raw, "current_depth")
         )
+        trap_state = data.get("trap_state")
+        if trap_state is not None:
+            _load_trap_state(session, trap_state)
 
         entities = _expect_list(data.get("entities", []), "entities")
         max_entity_id = 0
@@ -496,6 +612,36 @@ class PersistenceSystem:
                         hp=_expect_int(fighter_data.get("hp"), "entity.fighter.hp"),
                         power=_expect_int(fighter_data.get("power"), "entity.fighter.power"),
                         defense=_expect_int(fighter_data.get("defense"), "entity.fighter.defense"),
+                    ),
+                )
+
+            raw_progression = entity_data.get("progression")
+            if raw_progression is not None:
+                progression_data = _expect_dict(raw_progression, "entity.progression")
+                session.ecs.add_component(
+                    entity_id,
+                    Progression(
+                        level=_expect_int(
+                            progression_data.get("level"),
+                            "entity.progression.level",
+                        ),
+                        xp=_expect_int(progression_data.get("xp"), "entity.progression.xp"),
+                        xp_to_next=_expect_int(
+                            progression_data.get("xp_to_next"),
+                            "entity.progression.xp_to_next",
+                        ),
+                    ),
+                )
+
+            raw_status = entity_data.get("status")
+            if raw_status is not None:
+                status_data = _expect_dict(raw_status, "entity.status")
+                session.ecs.add_component(
+                    entity_id,
+                    StatusEffects(
+                        poison=_expect_int(status_data.get("poison", 0), "entity.status.poison"),
+                        bleed=_expect_int(status_data.get("bleed", 0), "entity.status.bleed"),
+                        stun=_expect_int(status_data.get("stun", 0), "entity.status.stun"),
                     ),
                 )
 
@@ -600,6 +746,24 @@ class PersistenceSystem:
                     ),
                 )
 
+            raw_ranged = entity_data.get("ranged")
+            if raw_ranged is not None:
+                ranged_data = _expect_dict(raw_ranged, "entity.ranged")
+                session.ecs.add_component(
+                    entity_id,
+                    RangedWeapon(
+                        damage=_expect_int(ranged_data.get("damage"), "entity.ranged.damage"),
+                        range=_expect_int(ranged_data.get("range"), "entity.ranged.range"),
+                    ),
+                )
+
+            xp_reward_raw = entity_data.get("xp_reward")
+            if xp_reward_raw is not None:
+                session.ecs.add_component(
+                    entity_id,
+                    ExperienceReward(xp=_expect_int(xp_reward_raw, "entity.xp_reward")),
+                )
+
         if player_entity is None:
             msg = "Save data is missing player entity."
             raise ValueError(msg)
@@ -625,12 +789,114 @@ class PersistenceSystem:
             player_map.kind = current_map_kind
             player_map.depth = current_depth
 
+        _ensure_status_components(session)
+        _ensure_progression_component(session)
+        _ensure_monster_xp_rewards(session)
+
         _ = session.player_position
         _ = session.player_fighter
         _ = session.player_inventory
         _ = session.player_hunger
         _ = session.player_equipment
+        _ = session.player_progression
         return session
+
+
+def _serialize_trap_state(session: "GameSession") -> dict[str, object]:
+    dungeon: dict[str, list[list[int]]] = {}
+    for tile_map in session.dungeon_levels:
+        coords = sorted(tile_map.trap_positions)
+        dungeon[str(tile_map.depth)] = [[x, y] for x, y in coords]
+
+    return {
+        "overworld": [[x, y] for x, y in sorted(session.overworld.trap_positions)],
+        "dungeon": dungeon,
+    }
+
+
+def _load_trap_state(session: "GameSession", raw: object) -> None:
+    data = _expect_dict(raw, "trap_state")
+    overworld_raw = _expect_list(data.get("overworld", []), "trap_state.overworld")
+    session.overworld.trap_positions = _coords_set(overworld_raw, "trap_state.overworld")
+
+    dungeon_raw = _expect_dict(data.get("dungeon", {}), "trap_state.dungeon")
+    for depth_text, coords_raw in dungeon_raw.items():
+        depth = _expect_int(depth_text_to_int(depth_text), "trap_state.dungeon.depth")
+        if depth < 1 or depth > len(session.dungeon_levels):
+            continue
+        coords_list = _expect_list(coords_raw, f"trap_state.dungeon.{depth}")
+        session.dungeon_levels[depth - 1].trap_positions = _coords_set(
+            coords_list,
+            f"trap_state.dungeon.{depth}",
+        )
+
+
+def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
+    version = _expect_int(data.get("version", 2), "version")
+    if version == 3:
+        return data
+    if version == 2:
+        migrated = dict(data)
+        migrated["version"] = 3
+        migrated.setdefault("regen_counter", 0)
+        return migrated
+
+    msg = f"Unsupported save version: {version}"
+    raise ValueError(msg)
+
+
+def _ensure_status_components(session: "GameSession") -> None:
+    for entity_id, fighter in session.ecs.entities_with(Fighter):
+        if fighter.hp <= 0:
+            continue
+        if session.ecs.get_component(entity_id, StatusEffects) is None:
+            session.ecs.add_component(entity_id, StatusEffects())
+
+
+def _ensure_progression_component(session: "GameSession") -> None:
+    if session.ecs.get_component(session.player_entity, Progression) is not None:
+        return
+
+    session.ecs.add_component(
+        session.player_entity,
+        Progression(
+            level=1,
+            xp=0,
+            xp_to_next=session.character_class.xp_base,
+        ),
+    )
+
+
+def _ensure_monster_xp_rewards(session: "GameSession") -> None:
+    for entity_id, _ in session.ecs.entities_with(Monster):
+        if session.ecs.get_component(entity_id, ExperienceReward) is None:
+            session.ecs.add_component(entity_id, ExperienceReward(xp=10))
+
+
+def _coords_set(raw_list: list[object], field_name: str) -> set[tuple[int, int]]:
+    result: set[tuple[int, int]] = set()
+    for idx, raw in enumerate(raw_list):
+        pair = _expect_list(raw, f"{field_name}[{idx}]")
+        if len(pair) != 2:
+            msg = f"{field_name}[{idx}] must contain exactly two coordinates."
+            raise ValueError(msg)
+        x = _expect_int(pair[0], f"{field_name}[{idx}][0]")
+        y = _expect_int(pair[1], f"{field_name}[{idx}][1]")
+        result.add((x, y))
+    return result
+
+
+def depth_text_to_int(raw: object) -> int:
+    if isinstance(raw, int):
+        return raw
+    if not isinstance(raw, str):
+        msg = "trap depth key must be string or integer."
+        raise ValueError(msg)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        msg = f"Invalid trap depth key: {raw}"
+        raise ValueError(msg) from exc
 
 
 def _expect_dict(value: object, field_name: str) -> dict[str, object]:

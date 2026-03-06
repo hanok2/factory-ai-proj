@@ -82,3 +82,28 @@ class Food:
 class Hunger:
     current: int
     max_value: int
+
+
+@dataclass(slots=True)
+class Progression:
+    level: int
+    xp: int
+    xp_to_next: int
+
+
+@dataclass(slots=True)
+class StatusEffects:
+    poison: int = 0
+    bleed: int = 0
+    stun: int = 0
+
+
+@dataclass(slots=True)
+class RangedWeapon:
+    damage: int
+    range: int
+
+
+@dataclass(slots=True)
+class ExperienceReward:
+    xp: int

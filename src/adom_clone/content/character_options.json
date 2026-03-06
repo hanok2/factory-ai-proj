@@ -32,7 +32,11 @@
       "base_hp": 20,
       "base_power": 5,
       "base_defense": 1,
-      "starting_items": ["short_sword", "leather_armor", "ration"]
+      "starting_items": ["short_sword", "leather_armor", "ration"],
+      "xp_base": 20,
+      "hp_per_level": 3,
+      "power_every": 2,
+      "defense_every": 3
     },
     {
       "id": "thief",
@@ -40,7 +44,11 @@
       "base_hp": 16,
       "base_power": 4,
       "base_defense": 1,
-      "starting_items": ["dagger", "leather_armor", "ration"]
+      "starting_items": ["dagger", "throwing_knife", "leather_armor", "ration"],
+      "xp_base": 18,
+      "hp_per_level": 2,
+      "power_every": 3,
+      "defense_every": 3
     },
     {
       "id": "wizard",
@@ -48,7 +56,11 @@
       "base_hp": 14,
       "base_power": 3,
       "base_defense": 0,
-      "starting_items": ["oak_staff", "ration", "healing_potion"]
+      "starting_items": ["oak_staff", "throwing_knife", "ration", "healing_potion"],
+      "xp_base": 16,
+      "hp_per_level": 2,
+      "power_every": 2,
+      "defense_every": 4
     }
   ]
 }

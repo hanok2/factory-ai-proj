@@ -10,6 +10,7 @@ from adom_clone.core.ecs.components import (
     Equipment,
     EquipmentSlot,
     Equippable,
+    ExperienceReward,
     Fighter,
     Food,
     Hunger,
@@ -19,6 +20,9 @@ from adom_clone.core.ecs.components import (
     OnMap,
     Player,
     Position,
+    Progression,
+    RangedWeapon,
+    StatusEffects,
 )
 from adom_clone.core.ecs.store import ECSStore
 from adom_clone.core.game.actions import GameAction
@@ -80,6 +84,7 @@ class GameSession:
         self.game_over = False
         self.turn_count = 0
         self.kill_count = 0
+        self.regen_counter = 0
         self._action_queue: deque[GameAction] = deque()
 
         self.turn_system = TurnSystem()
@@ -153,6 +158,22 @@ class GameSession:
         return equipment
 
     @property
+    def player_progression(self) -> Progression:
+        progression = self.ecs.get_component(self.player_entity, Progression)
+        if progression is None:
+            msg = "Player entity is missing Progression component."
+            raise RuntimeError(msg)
+        return progression
+
+    @property
+    def player_status(self) -> StatusEffects:
+        status = self.ecs.get_component(self.player_entity, StatusEffects)
+        if status is None:
+            msg = "Player entity is missing StatusEffects component."
+            raise RuntimeError(msg)
+        return status
+
+    @property
     def player_hp_text(self) -> str:
         fighter = self.player_fighter
         return f"{fighter.hp}/{fighter.max_hp}"
@@ -170,6 +191,11 @@ class GameSession:
     def player_defense(self) -> int:
         return self.combat_system.effective_defense(self, self.player_entity)
 
+    @property
+    def player_level_text(self) -> str:
+        progression = self.player_progression
+        return f"Lv {progression.level} | XP {progression.xp}/{progression.xp_to_next}"
+
     def add_message(self, text: str) -> None:
         self.messages.append(text)
         if len(self.messages) > 250:
@@ -180,6 +206,166 @@ class GameSession:
 
     def advance_turn(self) -> None:
         self.turn_system.advance_turn(self)
+
+    def consume_player_stun_turn(self) -> bool:
+        status = self.player_status
+        if status.stun <= 0:
+            return False
+        status.stun -= 1
+        self.add_message("You are stunned and cannot act.")
+        return True
+
+    def consume_monster_stun_turn(self, entity_id: int) -> bool:
+        status = self.ecs.get_component(entity_id, StatusEffects)
+        if status is None or status.stun <= 0:
+            return False
+        status.stun -= 1
+        return True
+
+    def apply_status_damage(self, entity_id: int) -> None:
+        fighter = self.ecs.get_component(entity_id, Fighter)
+        status = self.ecs.get_component(entity_id, StatusEffects)
+        if fighter is None or status is None or fighter.hp <= 0:
+            return
+
+        damage = 0
+        if status.poison > 0:
+            status.poison -= 1
+            damage += 1
+        if status.bleed > 0:
+            status.bleed -= 1
+            damage += 1
+        if damage <= 0:
+            return
+
+        fighter.hp -= damage
+        if entity_id == self.player_entity:
+            self.add_message(f"You suffer {damage} damage from ongoing effects.")
+        else:
+            monster = self.ecs.get_component(entity_id, Monster)
+            if monster is not None:
+                self.add_message(f"{monster.name} suffers {damage} damage from effects.")
+
+        if fighter.hp <= 0:
+            self._handle_death(entity_id)
+
+    def apply_natural_regen(self) -> None:
+        fighter = self.player_fighter
+        if fighter.hp >= fighter.max_hp:
+            self.regen_counter = 0
+            return
+        if self.has_adjacent_monster():
+            self.regen_counter = 0
+            return
+
+        self.regen_counter += 1
+        if self.regen_counter < 8:
+            return
+
+        self.regen_counter = 0
+        fighter.hp = min(fighter.max_hp, fighter.hp + 1)
+        self.add_message("You recover 1 HP.")
+
+    def rest_player(self) -> bool:
+        if self.has_adjacent_monster():
+            self.add_message("You cannot rest while enemies are nearby.")
+            return False
+
+        fighter = self.player_fighter
+        before_hp = fighter.hp
+        fighter.hp = min(fighter.max_hp, fighter.hp + 2)
+        healed = fighter.hp - before_hp
+        if healed <= 0:
+            self.add_message("You rest, but you are already fully healed.")
+            return True
+
+        self.add_message(f"You rest and recover {healed} HP.")
+        return True
+
+    def has_adjacent_monster(self) -> bool:
+        px, py = self.player_position.x, self.player_position.y
+        for entity_id, _ in self.ecs.entities_with(Monster):
+            position = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            fighter = self.ecs.get_component(entity_id, Fighter)
+            if position is None or on_map is None or fighter is None:
+                continue
+            if fighter.hp <= 0:
+                continue
+            if on_map.kind != self.current_map.kind or on_map.depth != self.current_depth:
+                continue
+            if abs(px - position.x) + abs(py - position.y) == 1:
+                return True
+        return False
+
+    def disarm_nearby_trap(self) -> bool:
+        trap = self._nearest_trap_to_player()
+        if trap is None:
+            self.add_message("There is no trap to disarm nearby.")
+            return False
+
+        self.current_map.trap_positions.discard(trap)
+        self.add_message("You disarm a trap.")
+        return True
+
+    def first_ranged_projectile(self) -> tuple[int, int, Item, RangedWeapon] | None:
+        for idx, item_id in enumerate(self.player_inventory.item_ids):
+            item = self.ecs.get_component(item_id, Item)
+            ranged = self.ecs.get_component(item_id, RangedWeapon)
+            if item is None or ranged is None:
+                continue
+            return idx, item_id, item, ranged
+        return None
+
+    def consume_inventory_item(self, slot_index: int, item_entity: int) -> None:
+        inventory = self.player_inventory
+        if 0 <= slot_index < len(inventory.item_ids):
+            inventory.item_ids.pop(slot_index)
+        self.destroy_item(item_entity)
+
+    def apply_status(
+        self,
+        entity_id: int,
+        *,
+        poison: int = 0,
+        bleed: int = 0,
+        stun: int = 0,
+    ) -> None:
+        status = self.ecs.get_component(entity_id, StatusEffects)
+        if status is None:
+            status = StatusEffects()
+            self.ecs.add_component(entity_id, status)
+
+        if poison > 0:
+            status.poison = max(status.poison, poison)
+        if bleed > 0:
+            status.bleed = max(status.bleed, bleed)
+        if stun > 0:
+            status.stun = max(status.stun, stun)
+
+    def grant_player_xp(self, xp: int) -> None:
+        if xp <= 0:
+            return
+
+        progression = self.player_progression
+        progression.xp += xp
+        self.add_message(f"You gain {xp} XP.")
+
+        while progression.xp >= progression.xp_to_next:
+            progression.xp -= progression.xp_to_next
+            progression.level += 1
+            progression.xp_to_next = self.character_class.xp_base + progression.level * 6
+
+            fighter = self.player_fighter
+            hp_gain = max(1, self.character_class.hp_per_level)
+            fighter.max_hp += hp_gain
+            fighter.hp += hp_gain
+            if progression.level % max(1, self.character_class.power_every) == 0:
+                fighter.power += 1
+            if progression.level % max(1, self.character_class.defense_every) == 0:
+                fighter.defense += 1
+
+            self.add_message(f"You advance to level {progression.level}!")
 
     def tick_hunger(self) -> None:
         hunger = self.player_hunger
@@ -217,6 +403,9 @@ class GameSession:
 
         position.x = nx
         position.y = ny
+        self._trigger_player_trap_if_present()
+        if self.game_over:
+            return True
         self._handle_transition_if_needed()
         return True
 
@@ -264,6 +453,7 @@ class GameSession:
         self.ecs.remove_component(item_entity, Item)
         self.ecs.remove_component(item_entity, Consumable)
         self.ecs.remove_component(item_entity, Equippable)
+        self.ecs.remove_component(item_entity, RangedWeapon)
         self.ecs.remove_component(item_entity, Food)
         self.ecs.remove_component(item_entity, Position)
         self.ecs.remove_component(item_entity, OnMap)
@@ -275,14 +465,19 @@ class GameSession:
             return
 
         monster = self.ecs.get_component(entity_id, Monster)
+        reward = self.ecs.get_component(entity_id, ExperienceReward)
         name = monster.name if monster is not None else "monster"
         self.ecs.remove_component(entity_id, Monster)
         self.ecs.remove_component(entity_id, Fighter)
         self.ecs.remove_component(entity_id, BlocksMovement)
         self.ecs.remove_component(entity_id, Position)
         self.ecs.remove_component(entity_id, OnMap)
+        self.ecs.remove_component(entity_id, StatusEffects)
+        self.ecs.remove_component(entity_id, ExperienceReward)
         self.kill_count += 1
         self.add_message(f"{name} dies.")
+        if reward is not None:
+            self.grant_player_xp(reward.xp)
 
     def serializable_entity_ids(self) -> list[int]:
         entity_ids = {self.player_entity}
@@ -297,9 +492,13 @@ class GameSession:
             Item,
             Consumable,
             Equippable,
+            RangedWeapon,
             Equipment,
             Food,
             Hunger,
+            StatusEffects,
+            Progression,
+            ExperienceReward,
         )
         for component_type in component_types:
             for entity_id, _ in self.ecs.entities_with(component_type):
@@ -341,6 +540,9 @@ class GameSession:
             if on_map.kind == self.current_map.kind and on_map.depth == self.current_depth:
                 positions.append((position.x, position.y))
         return positions
+
+    def trap_positions(self) -> list[tuple[int, int]]:
+        return sorted(self.current_map.trap_positions)
 
     def inventory_names(self) -> list[str]:
         names: list[str] = []
@@ -398,6 +600,11 @@ class GameSession:
             self.player_entity,
             Hunger(current=self.race.hunger_max, max_value=self.race.hunger_max),
         )
+        self.ecs.add_component(
+            self.player_entity,
+            Progression(level=1, xp=0, xp_to_next=self.character_class.xp_base),
+        )
+        self.ecs.add_component(self.player_entity, StatusEffects())
 
     def _spawn_world_content(self) -> None:
         self._spawn_item_rules(self.spawn_content.overworld_items, MapKind.OVERWORLD, depth=None)
@@ -444,6 +651,8 @@ class GameSession:
             for x in range(1, tile_map.width - 1):
                 if not tile_map.is_passable(x, y):
                     continue
+                if (x, y) in tile_map.trap_positions:
+                    continue
                 if map_kind == MapKind.OVERWORLD and tile_map.entrance_pos == (x, y):
                     continue
                 if map_kind == MapKind.DUNGEON and (
@@ -474,6 +683,8 @@ class GameSession:
                 defense=template.defense,
             ),
         )
+        self.ecs.add_component(entity_id, ExperienceReward(xp=template.xp_reward))
+        self.ecs.add_component(entity_id, StatusEffects())
         self.ecs.add_component(entity_id, Position(x, y))
         self.ecs.add_component(entity_id, OnMap(MapKind.DUNGEON, depth=depth))
         self.ecs.add_component(entity_id, BlocksMovement())
@@ -506,6 +717,11 @@ class GameSession:
                     power_bonus=template.power_bonus,
                     defense_bonus=template.defense_bonus,
                 ),
+            )
+        if template.ranged_damage is not None and template.ranged_range is not None:
+            self.ecs.add_component(
+                entity_id,
+                RangedWeapon(damage=template.ranged_damage, range=template.ranged_range),
             )
         return entity_id
 
@@ -587,6 +803,44 @@ class GameSession:
                 position.x, position.y = target_pos
                 self.add_message(f"You ascend to dungeon level {target.depth}.")
 
+    def _trigger_player_trap_if_present(self) -> None:
+        pos = (self.player_position.x, self.player_position.y)
+        if pos not in self.current_map.trap_positions:
+            return
+
+        self.current_map.trap_positions.discard(pos)
+        depth = 0 if self.current_depth is None else self.current_depth
+        trap_damage = 2 + depth
+        self.player_fighter.hp -= trap_damage
+
+        selector = (pos[0] * 31 + pos[1] * 17 + depth) % 3
+        if selector == 0:
+            self.apply_status(self.player_entity, poison=3)
+            effect_text = "poison"
+        elif selector == 1:
+            self.apply_status(self.player_entity, bleed=3)
+            effect_text = "bleeding"
+        else:
+            self.apply_status(self.player_entity, stun=1)
+            effect_text = "stun"
+
+        self.add_message(f"You trigger a trap for {trap_damage} damage and suffer {effect_text}.")
+        if self.player_fighter.hp <= 0:
+            self._handle_death(self.player_entity)
+
+    def _nearest_trap_to_player(self) -> tuple[int, int] | None:
+        px, py = self.player_position.x, self.player_position.y
+        candidates = [
+            pos
+            for pos in self.current_map.trap_positions
+            if abs(pos[0] - px) <= 1 and abs(pos[1] - py) <= 1
+        ]
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda pos: (abs(pos[0] - px) + abs(pos[1] - py), pos[1], pos[0]))
+        return candidates[0]
+
     def _adjacent_open_tile(
         self,
         tile_map: TileMap,
@@ -604,7 +858,7 @@ class GameSession:
             (ax, ay),
         ]
         for x, y in candidates:
-            if tile_map.is_passable(x, y):
+            if tile_map.is_passable(x, y) and (x, y) not in tile_map.trap_positions:
                 return (x, y)
         return anchor
 

@@ -63,6 +63,17 @@ def generate_dungeon(
         down_x, down_y = stairs_down_pos
         tiles[down_y][down_x] = STAIRS_DOWN
 
+    trap_positions = _generate_trap_positions(
+        rng=rng,
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+        depth=depth,
+        exit_pos=exit_pos,
+        stairs_down_pos=stairs_down_pos,
+    )
+
     return TileMap(
         kind=MapKind.DUNGEON,
         width=width,
@@ -71,6 +82,7 @@ def generate_dungeon(
         depth=depth,
         exit_pos=exit_pos,
         stairs_down_pos=stairs_down_pos,
+        trap_positions=trap_positions,
     )
 
 
@@ -90,3 +102,26 @@ def generate_dungeon_levels(
         )
         for depth in range(1, level_count + 1)
     ]
+
+
+def _generate_trap_positions(
+    rng: random.Random,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    depth: int,
+    exit_pos: tuple[int, int],
+    stairs_down_pos: tuple[int, int] | None,
+) -> set[tuple[int, int]]:
+    candidates: list[tuple[int, int]] = []
+    for y in range(top + 1, bottom - 1):
+        for x in range(left + 1, right - 1):
+            pos = (x, y)
+            if pos == exit_pos or pos == stairs_down_pos:
+                continue
+            candidates.append(pos)
+
+    rng.shuffle(candidates)
+    trap_count = min(len(candidates), 2 + depth)
+    return set(candidates[:trap_count])
