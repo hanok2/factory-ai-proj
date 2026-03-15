@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from adom_clone.core.ecs.components import (
     BlocksMovement,
     Consumable,
+    DamageType,
     Equipment,
     EquipmentSlot,
     Equippable,
@@ -16,13 +17,18 @@ from adom_clone.core.ecs.components import (
     Hunger,
     Inventory,
     Item,
+    Mana,
     Monster,
+    Npc,
+    NpcRole,
     OnMap,
     Player,
     Position,
     Progression,
     RangedWeapon,
+    Resistances,
     StatusEffects,
+    Talents,
 )
 from adom_clone.core.ecs.store import ECSStore
 from adom_clone.core.game.actions import GameAction
@@ -42,7 +48,11 @@ from adom_clone.core.game.systems import (
     PersistenceSystem,
     TurnSystem,
 )
-from adom_clone.core.world.generators import generate_dungeon_levels, generate_overworld
+from adom_clone.core.world.generators import (
+    generate_dungeon_levels,
+    generate_overworld,
+    generate_town,
+)
 from adom_clone.core.world.map_model import MapKind, TileMap
 
 
@@ -51,6 +61,27 @@ class CharacterSelection:
     race_id: str
     class_id: str
     seed: int
+
+
+@dataclass(slots=True)
+class QuestState:
+    """Tracks a single early-game quest used for world-state persistence scaffolding."""
+
+    quest_id: str = "town_goblin_cull"
+    accepted: bool = False
+    target_kills: int = 3
+    completed: bool = False
+    turned_in: bool = False
+
+
+TALENT_DESCRIPTIONS: dict[str, str] = {
+    # Improves spell throughput by reducing mana costs.
+    "arcane_efficiency": "Reduce all spell mana costs by 1.",
+    # Improves trap discovery odds to support hidden-trap gameplay.
+    "keen_senses": "Greatly improves hidden-trap detection.",
+    # Adds flat physical mitigation to support survivability builds.
+    "hardened": "Gain +10% physical resistance.",
+}
 
 
 class GameSession:
@@ -75,6 +106,7 @@ class GameSession:
 
         self.ecs = ECSStore()
         self.overworld = generate_overworld()
+        self.town = generate_town()
         self.dungeon_levels = generate_dungeon_levels(dungeon_level_count, seed)
         self.dungeon = self.dungeon_levels[0]
         self.current_map: TileMap = self.overworld
@@ -85,6 +117,7 @@ class GameSession:
         self.turn_count = 0
         self.kill_count = 0
         self.regen_counter = 0
+        self.quest_state = QuestState()
         self._action_queue: deque[GameAction] = deque()
 
         self.turn_system = TurnSystem()
@@ -96,6 +129,7 @@ class GameSession:
         self.player_entity = self.ecs.create_entity()
         self._spawn_player()
         self._spawn_world_content()
+        self._spawn_town_npcs()
         self._grant_starting_loadout()
 
         self.add_message(
@@ -174,6 +208,30 @@ class GameSession:
         return status
 
     @property
+    def player_mana(self) -> Mana:
+        mana = self.ecs.get_component(self.player_entity, Mana)
+        if mana is None:
+            msg = "Player entity is missing Mana component."
+            raise RuntimeError(msg)
+        return mana
+
+    @property
+    def player_talents(self) -> Talents:
+        talents = self.ecs.get_component(self.player_entity, Talents)
+        if talents is None:
+            msg = "Player entity is missing Talents component."
+            raise RuntimeError(msg)
+        return talents
+
+    @property
+    def player_resistances(self) -> Resistances:
+        resistances = self.ecs.get_component(self.player_entity, Resistances)
+        if resistances is None:
+            msg = "Player entity is missing Resistances component."
+            raise RuntimeError(msg)
+        return resistances
+
+    @property
     def player_hp_text(self) -> str:
         fighter = self.player_fighter
         return f"{fighter.hp}/{fighter.max_hp}"
@@ -182,6 +240,11 @@ class GameSession:
     def player_hunger_text(self) -> str:
         hunger = self.player_hunger
         return f"{hunger.current}/{hunger.max_value}"
+
+    @property
+    def player_mana_text(self) -> str:
+        mana = self.player_mana
+        return f"{mana.current}/{mana.max_value}"
 
     @property
     def player_power(self) -> int:
@@ -196,6 +259,32 @@ class GameSession:
         progression = self.player_progression
         return f"Lv {progression.level} | XP {progression.xp}/{progression.xp_to_next}"
 
+    @property
+    def player_talents_text(self) -> str:
+        talents = self.player_talents
+        if not talents.selected:
+            return "Talents: none"
+        return f"Talents: {', '.join(talents.selected)}"
+
+    @property
+    def quest_text(self) -> str:
+        quest = self.quest_state
+        if not quest.accepted:
+            return "Quest: not accepted"
+        if quest.turned_in:
+            return "Quest: completed"
+        if quest.completed:
+            return "Quest: return to Captain Durn"
+        remaining = max(0, quest.target_kills - self.kill_count)
+        return f"Quest: {remaining} kills remaining"
+
+    @property
+    def spellbook_text(self) -> str:
+        spells = self.character_class.starting_spells
+        if not spells:
+            return "Spells: none"
+        return "Spells: " + ", ".join(spells)
+
     def add_message(self, text: str) -> None:
         self.messages.append(text)
         if len(self.messages) > 250:
@@ -206,6 +295,235 @@ class GameSession:
 
     def advance_turn(self) -> None:
         self.turn_system.advance_turn(self)
+
+    def cast_arcane_bolt(self, dx: int, dy: int) -> bool:
+        """Cast a directional projectile spell that deals ARCANE damage."""
+        if dx == 0 and dy == 0:
+            self.add_message("Choose a direction for Arcane Bolt.")
+            return False
+        if not self.has_spell("arcane_bolt"):
+            self.add_message("You have not learned Arcane Bolt.")
+            return False
+
+        mana_cost = self._spell_cost(4)
+        if not self._spend_mana(mana_cost):
+            return False
+
+        start = self.player_position
+        max_range = 6
+        for step in range(1, max_range + 1):
+            tx = start.x + dx * step
+            ty = start.y + dy * step
+            if not self.current_map.in_bounds(tx, ty):
+                break
+            if not self.current_map.is_passable(tx, ty):
+                break
+
+            blocker = self.blocking_entity_at(
+                tx,
+                ty,
+                self.current_map.kind,
+                self.current_depth,
+                self.player_entity,
+            )
+            if blocker is None:
+                continue
+
+            if self.ecs.get_component(blocker, Fighter) is None:
+                break
+
+            base_damage = 5 + self.player_progression.level // 2
+            actual, mitigated = self.apply_damage(
+                blocker,
+                base_damage,
+                DamageType.ARCANE,
+                source="Arcane Bolt",
+            )
+            self._log_player_damage(
+                blocker,
+                "Arcane Bolt",
+                DamageType.ARCANE,
+                actual,
+                mitigated,
+            )
+            return True
+
+        self.add_message("Arcane Bolt dissipates without hitting a target.")
+        return True
+
+    def cast_mend(self) -> bool:
+        """Cast a utility self-heal spell to satisfy the utility spell baseline."""
+        if not self.has_spell("mend"):
+            self.add_message("You have not learned Mend.")
+            return False
+
+        mana_cost = self._spell_cost(3)
+        if not self._spend_mana(mana_cost):
+            return False
+
+        fighter = self.player_fighter
+        before = fighter.hp
+        heal_amount = 4 + self.player_progression.level // 3
+        fighter.hp = min(fighter.max_hp, fighter.hp + heal_amount)
+        healed = fighter.hp - before
+        if healed <= 0:
+            self.add_message("Mend shimmers, but you are already at full health.")
+        else:
+            self.add_message(f"Mend restores {healed} HP.")
+        return True
+
+    def select_talent(self, talent_id: str) -> bool:
+        """Spend talent points on a permanent passive talent choice."""
+        talents = self.player_talents
+        if talent_id not in TALENT_DESCRIPTIONS:
+            self.add_message("Unknown talent selection.")
+            return False
+        if talent_id in talents.selected:
+            self.add_message("You already learned that talent.")
+            return False
+        if talents.points <= 0:
+            self.add_message("No talent points available.")
+            return False
+
+        talents.selected.append(talent_id)
+        talents.points -= 1
+
+        # Apply immediate one-time effects for talents that grant base stats.
+        if talent_id == "hardened":
+            self.player_resistances.physical_pct = min(
+                80,
+                self.player_resistances.physical_pct + 10,
+            )
+
+        self.add_message(f"Talent learned: {talent_id}.")
+        return True
+
+    def interact_with_adjacent_npc(self) -> bool:
+        """Interact with adjacent town NPCs for services and quest progression."""
+        npc_entity = self._adjacent_npc()
+        if npc_entity is None:
+            self.add_message("No one nearby to interact with.")
+            return False
+
+        npc = self.ecs.get_component(npc_entity, Npc)
+        if npc is None:
+            self.add_message("That interaction target is invalid.")
+            return False
+
+        if npc.role == NpcRole.QUEST_GIVER:
+            return self._interact_quest_giver(npc)
+        if npc.role == NpcRole.HEALER:
+            return self._interact_healer(npc)
+        if npc.role == NpcRole.SHOPKEEPER:
+            return self._interact_shopkeeper(npc)
+
+        self.add_message("They have nothing to offer right now.")
+        return False
+
+    def has_spell(self, spell_id: str) -> bool:
+        return spell_id in self.character_class.starting_spells
+
+    def available_talent_options(self) -> list[tuple[str, str]]:
+        talents = self.player_talents
+        options: list[tuple[str, str]] = []
+        for talent_id, description in TALENT_DESCRIPTIONS.items():
+            if talent_id in talents.selected:
+                continue
+            options.append((talent_id, description))
+        return options
+
+    def apply_damage(
+        self,
+        entity_id: int,
+        raw_damage: int,
+        damage_type: DamageType,
+        *,
+        source: str,
+    ) -> tuple[int, int]:
+        """Apply typed damage with resistance mitigation and death handling.
+
+        Returns `(actual_damage, mitigated_damage)` for combat log rendering.
+        """
+        fighter = self.ecs.get_component(entity_id, Fighter)
+        if fighter is None or fighter.hp <= 0:
+            return (0, 0)
+
+        resistance_pct = self._resistance_for(entity_id, damage_type)
+        mitigated = (max(0, raw_damage) * resistance_pct) // 100
+        actual = max(1, raw_damage - mitigated)
+
+        fighter.hp -= actual
+        if fighter.hp <= 0:
+            self._handle_death(entity_id)
+
+        return (actual, mitigated)
+
+    def _resistance_for(self, entity_id: int, damage_type: DamageType) -> int:
+        resist = self.ecs.get_component(entity_id, Resistances)
+        if resist is None:
+            return 0
+
+        if damage_type == DamageType.PHYSICAL:
+            return max(0, min(80, resist.physical_pct))
+        if damage_type == DamageType.POISON:
+            return max(0, min(80, resist.poison_pct))
+        return max(0, min(80, resist.arcane_pct))
+
+    def _spell_cost(self, base_cost: int) -> int:
+        if "arcane_efficiency" in self.player_talents.selected:
+            return max(1, base_cost - 1)
+        return base_cost
+
+    def _spend_mana(self, amount: int) -> bool:
+        mana = self.player_mana
+        if mana.current < amount:
+            self.add_message(f"Not enough mana ({mana.current}/{amount}).")
+            return False
+        mana.current -= amount
+        return True
+
+    def _log_player_damage(
+        self,
+        defender: int,
+        source: str,
+        damage_type: DamageType,
+        actual: int,
+        mitigated: int,
+    ) -> None:
+        monster = self.ecs.get_component(defender, Monster)
+        target_name = monster.name if monster is not None else "target"
+        self.add_message(
+            f"{source} hits {target_name} for {actual} {damage_type.value} damage"
+            f" ({mitigated} resisted).",
+        )
+
+    def _regenerate_mana(self) -> None:
+        mana = self.player_mana
+        if mana.current < mana.max_value:
+            mana.current += 1
+
+    def detect_nearby_traps(self) -> None:
+        """Reveal hidden traps near the player based on deterministic perception checks."""
+        px, py = self.player_position.x, self.player_position.y
+        perception_bonus = 35 if "keen_senses" in self.player_talents.selected else 0
+
+        for trap in list(self.current_map.trap_positions):
+            if trap in self.current_map.discovered_traps:
+                continue
+            dist = abs(trap[0] - px) + abs(trap[1] - py)
+            if dist > 4:
+                continue
+
+            if dist <= 1:
+                self.current_map.discovered_traps.add(trap)
+                self.add_message(f"You notice a trap at {trap}.")
+                continue
+
+            roll_seed = self.turn_count + trap[0] * 11 + trap[1] * 17 + self.seed
+            roll = roll_seed % 100
+            if roll < 20 + perception_bonus:
+                self.current_map.discovered_traps.add(trap)
+                self.add_message(f"You spot a hidden trap at {trap}.")
 
     def consume_player_stun_turn(self) -> bool:
         status = self.player_status
@@ -228,43 +546,29 @@ class GameSession:
         if fighter is None or status is None or fighter.hp <= 0:
             return
 
-        damage = 0
         if status.poison > 0:
             status.poison -= 1
-            damage += 1
+            self.apply_damage(entity_id, 1, DamageType.POISON, source="poison")
         if status.bleed > 0:
             status.bleed -= 1
-            damage += 1
-        if damage <= 0:
-            return
-
-        fighter.hp -= damage
-        if entity_id == self.player_entity:
-            self.add_message(f"You suffer {damage} damage from ongoing effects.")
-        else:
-            monster = self.ecs.get_component(entity_id, Monster)
-            if monster is not None:
-                self.add_message(f"{monster.name} suffers {damage} damage from effects.")
-
-        if fighter.hp <= 0:
-            self._handle_death(entity_id)
+            self.apply_damage(entity_id, 1, DamageType.PHYSICAL, source="bleeding")
 
     def apply_natural_regen(self) -> None:
         fighter = self.player_fighter
         if fighter.hp >= fighter.max_hp:
             self.regen_counter = 0
-            return
-        if self.has_adjacent_monster():
-            self.regen_counter = 0
-            return
+        else:
+            if self.has_adjacent_monster():
+                self.regen_counter = 0
+            else:
+                self.regen_counter += 1
+                if self.regen_counter >= 8:
+                    self.regen_counter = 0
+                    fighter.hp = min(fighter.max_hp, fighter.hp + 1)
+                    self.add_message("You recover 1 HP.")
 
-        self.regen_counter += 1
-        if self.regen_counter < 8:
-            return
-
-        self.regen_counter = 0
-        fighter.hp = min(fighter.max_hp, fighter.hp + 1)
-        self.add_message("You recover 1 HP.")
+        self._regenerate_mana()
+        self.detect_nearby_traps()
 
     def rest_player(self) -> bool:
         if self.has_adjacent_monster():
@@ -305,6 +609,7 @@ class GameSession:
             return False
 
         self.current_map.trap_positions.discard(trap)
+        self.current_map.discovered_traps.discard(trap)
         self.add_message("You disarm a trap.")
         return True
 
@@ -360,10 +665,20 @@ class GameSession:
             hp_gain = max(1, self.character_class.hp_per_level)
             fighter.max_hp += hp_gain
             fighter.hp += hp_gain
+
+            mana = self.player_mana
+            mana_gain = max(1, self.character_class.mana_per_level)
+            mana.max_value += mana_gain
+            mana.current = min(mana.max_value, mana.current + mana_gain)
+
             if progression.level % max(1, self.character_class.power_every) == 0:
                 fighter.power += 1
             if progression.level % max(1, self.character_class.defense_every) == 0:
                 fighter.defense += 1
+
+            if progression.level in self.character_class.talent_milestones:
+                self.player_talents.points += 1
+                self.add_message("You gained a talent point. Open talents with [T].")
 
             self.add_message(f"You advance to level {progression.level}!")
 
@@ -374,11 +689,13 @@ class GameSession:
         if hunger.current in (80, 50, 25, 10):
             self.add_message("You feel hungry.")
         if hunger.current <= 0:
-            fighter = self.player_fighter
-            fighter.hp -= 1
-            self.add_message("You are starving!")
-            if fighter.hp <= 0:
-                self._handle_death(self.player_entity)
+            actual, mitigated = self.apply_damage(
+                self.player_entity,
+                1,
+                DamageType.PHYSICAL,
+                source="starvation",
+            )
+            self.add_message(f"You are starving! ({actual} damage, {mitigated} resisted)")
 
     def apply_move(self, dx: int, dy: int) -> bool:
         position = self.player_position
@@ -479,6 +796,11 @@ class GameSession:
         if reward is not None:
             self.grant_player_xp(reward.xp)
 
+        if self.quest_state.accepted and not self.quest_state.completed:
+            if self.kill_count >= self.quest_state.target_kills:
+                self.quest_state.completed = True
+                self.add_message("Quest update: Return to Captain Durn for your reward.")
+
     def serializable_entity_ids(self) -> list[int]:
         entity_ids = {self.player_entity}
         component_types: tuple[type[object], ...] = (
@@ -499,6 +821,10 @@ class GameSession:
             StatusEffects,
             Progression,
             ExperienceReward,
+            Resistances,
+            Mana,
+            Talents,
+            Npc,
         )
         for component_type in component_types:
             for entity_id, _ in self.ecs.entities_with(component_type):
@@ -530,6 +856,17 @@ class GameSession:
                 positions.append((position.x, position.y))
         return positions
 
+    def npc_positions(self) -> list[tuple[int, int]]:
+        positions: list[tuple[int, int]] = []
+        for entity_id, _npc in self.ecs.entities_with(Npc):
+            position = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            if position is None or on_map is None:
+                continue
+            if on_map.kind == self.current_map.kind and on_map.depth == self.current_depth:
+                positions.append((position.x, position.y))
+        return positions
+
     def item_positions(self) -> list[tuple[int, int]]:
         positions: list[tuple[int, int]] = []
         for entity_id, _item in self.ecs.entities_with(Item):
@@ -542,7 +879,7 @@ class GameSession:
         return positions
 
     def trap_positions(self) -> list[tuple[int, int]]:
-        return sorted(self.current_map.trap_positions)
+        return sorted(self.current_map.discovered_traps)
 
     def inventory_names(self) -> list[str]:
         names: list[str] = []
@@ -605,6 +942,12 @@ class GameSession:
             Progression(level=1, xp=0, xp_to_next=self.character_class.xp_base),
         )
         self.ecs.add_component(self.player_entity, StatusEffects())
+        self.ecs.add_component(
+            self.player_entity,
+            Mana(current=self.character_class.mana_base, max_value=self.character_class.mana_base),
+        )
+        self.ecs.add_component(self.player_entity, Talents())
+        self.ecs.add_component(self.player_entity, Resistances())
 
     def _spawn_world_content(self) -> None:
         self._spawn_item_rules(self.spawn_content.overworld_items, MapKind.OVERWORLD, depth=None)
@@ -612,6 +955,19 @@ class GameSession:
         for depth in range(1, self.dungeon_level_count + 1):
             self._spawn_item_rules(self.spawn_content.dungeon_items, MapKind.DUNGEON, depth=depth)
             self._spawn_monster_rules(self.spawn_content.dungeon_monsters, depth=depth)
+
+    def _spawn_town_npcs(self) -> None:
+        """Populate the town hub with baseline service NPCs used in Phase 6."""
+        self._spawn_npc("Sister Arin", NpcRole.HEALER, x=10, y=6)
+        self._spawn_npc("Borin", NpcRole.SHOPKEEPER, x=14, y=9)
+        self._spawn_npc("Captain Durn", NpcRole.QUEST_GIVER, x=8, y=10)
+
+    def _spawn_npc(self, name: str, role: NpcRole, x: int, y: int) -> None:
+        entity_id = self.ecs.create_entity()
+        self.ecs.add_component(entity_id, Npc(name=name, role=role))
+        self.ecs.add_component(entity_id, Position(x, y))
+        self.ecs.add_component(entity_id, OnMap(MapKind.TOWN, depth=None))
+        self.ecs.add_component(entity_id, BlocksMovement())
 
     def _spawn_item_rules(
         self,
@@ -685,6 +1041,14 @@ class GameSession:
         )
         self.ecs.add_component(entity_id, ExperienceReward(xp=template.xp_reward))
         self.ecs.add_component(entity_id, StatusEffects())
+        self.ecs.add_component(
+            entity_id,
+            Resistances(
+                physical_pct=template.physical_resist,
+                poison_pct=template.poison_resist,
+                arcane_pct=template.arcane_resist,
+            ),
+        )
         self.ecs.add_component(entity_id, Position(x, y))
         self.ecs.add_component(entity_id, OnMap(MapKind.DUNGEON, depth=depth))
         self.ecs.add_component(entity_id, BlocksMovement())
@@ -750,7 +1114,31 @@ class GameSession:
         position = self.player_position
         on_map = self.player_map
 
+        if self.current_map.kind == MapKind.TOWN and self.town.exit_pos is not None:
+            if (position.x, position.y) == self.town.exit_pos:
+                self.current_map = self.overworld
+                self.current_depth = None
+                on_map.kind = MapKind.OVERWORLD
+                on_map.depth = None
+                tx, ty = self.overworld.town_pos or (5, 5)
+                position.x, position.y = (tx + 1, ty)
+                self.add_message("You leave town and return to the overworld.")
+                return
+
         if self.current_map.kind == MapKind.OVERWORLD and self.overworld.entrance_pos is not None:
+            if (
+                self.overworld.town_pos is not None
+                and (position.x, position.y) == self.overworld.town_pos
+            ):
+                target_pos = self._adjacent_open_tile(self.town, self.town.exit_pos)
+                self.current_map = self.town
+                self.current_depth = None
+                on_map.kind = MapKind.TOWN
+                on_map.depth = None
+                position.x, position.y = target_pos
+                self.add_message("You enter the town of Terinyo.")
+                return
+
             if (position.x, position.y) == self.overworld.entrance_pos:
                 target = self.dungeon_levels[0]
                 target_pos = self._adjacent_open_tile(target, target.exit_pos)
@@ -809,9 +1197,15 @@ class GameSession:
             return
 
         self.current_map.trap_positions.discard(pos)
+        self.current_map.discovered_traps.discard(pos)
         depth = 0 if self.current_depth is None else self.current_depth
         trap_damage = 2 + depth
-        self.player_fighter.hp -= trap_damage
+        actual, mitigated = self.apply_damage(
+            self.player_entity,
+            trap_damage,
+            DamageType.PHYSICAL,
+            source="trap",
+        )
 
         selector = (pos[0] * 31 + pos[1] * 17 + depth) % 3
         if selector == 0:
@@ -824,15 +1218,16 @@ class GameSession:
             self.apply_status(self.player_entity, stun=1)
             effect_text = "stun"
 
-        self.add_message(f"You trigger a trap for {trap_damage} damage and suffer {effect_text}.")
-        if self.player_fighter.hp <= 0:
-            self._handle_death(self.player_entity)
+        self.add_message(
+            f"You trigger a trap for {actual} physical damage ({mitigated} resisted)"
+            f" and suffer {effect_text}.",
+        )
 
     def _nearest_trap_to_player(self) -> tuple[int, int] | None:
         px, py = self.player_position.x, self.player_position.y
         candidates = [
             pos
-            for pos in self.current_map.trap_positions
+            for pos in self.current_map.discovered_traps
             if abs(pos[0] - px) <= 1 and abs(pos[1] - py) <= 1
         ]
         if not candidates:
@@ -840,6 +1235,79 @@ class GameSession:
 
         candidates.sort(key=lambda pos: (abs(pos[0] - px) + abs(pos[1] - py), pos[1], pos[0]))
         return candidates[0]
+
+    def _adjacent_npc(self) -> int | None:
+        px, py = self.player_position.x, self.player_position.y
+        for entity_id, _npc in self.ecs.entities_with(Npc):
+            pos = self.ecs.get_component(entity_id, Position)
+            on_map = self.ecs.get_component(entity_id, OnMap)
+            if pos is None or on_map is None:
+                continue
+            if on_map.kind != self.current_map.kind or on_map.depth != self.current_depth:
+                continue
+            if abs(pos.x - px) + abs(pos.y - py) == 1:
+                return entity_id
+        return None
+
+    def _interact_quest_giver(self, npc: Npc) -> bool:
+        quest = self.quest_state
+        if not quest.accepted:
+            quest.accepted = True
+            self.add_message(
+                f"{npc.name}: Clear {quest.target_kills} monsters in the dungeon and return.",
+            )
+            return True
+
+        if quest.accepted and not quest.completed:
+            if self.kill_count >= quest.target_kills:
+                quest.completed = True
+                self.add_message(f"{npc.name}: Well done. Turn in to claim your reward.")
+                return True
+            remaining = max(0, quest.target_kills - self.kill_count)
+            self.add_message(f"{npc.name}: Keep going. {remaining} more kills needed.")
+            return True
+
+        if quest.completed and not quest.turned_in:
+            quest.turned_in = True
+            self.grant_player_xp(25)
+            self._grant_reward_item("healing_potion")
+            self.add_message(f"{npc.name}: Excellent work. Take this reward.")
+            return True
+
+        self.add_message(f"{npc.name}: You have already proven yourself.")
+        return True
+
+    def _interact_healer(self, npc: Npc) -> bool:
+        fighter = self.player_fighter
+        if fighter.hp >= fighter.max_hp and self.player_mana.current >= self.player_mana.max_value:
+            self.add_message(f"{npc.name}: You are already in peak condition.")
+            return True
+
+        fighter.hp = fighter.max_hp
+        self.player_mana.current = self.player_mana.max_value
+        self.player_status.poison = 0
+        self.player_status.bleed = 0
+        self.player_status.stun = 0
+        self.add_message(f"{npc.name} restores your health, mana, and cleanses ailments.")
+        return True
+
+    def _interact_shopkeeper(self, npc: Npc) -> bool:
+        inventory = self.player_inventory
+        if len(inventory.item_ids) >= inventory.capacity:
+            self.add_message(f"{npc.name}: Your pack is full.")
+            return False
+
+        reward_template = "ration" if self.turn_count % 2 == 0 else "throwing_knife"
+        self._grant_reward_item(reward_template)
+        self.add_message(f"{npc.name} hands you a {reward_template.replace('_', ' ')}.")
+        return True
+
+    def _grant_reward_item(self, template_id: str) -> None:
+        template = self.spawn_content.item_templates.get(template_id)
+        if template is None:
+            return
+        item_id = self._create_item_entity(template)
+        self.player_inventory.item_ids.append(item_id)
 
     def _adjacent_open_tile(
         self,

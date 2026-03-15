@@ -7,9 +7,10 @@ This repository currently contains a playable ADOM-inspired roguelike foundation
 - ECS-based entities/components and modular gameplay systems,
 - overworld + multi-depth dungeon transitions,
 - character creation (race/class/seed),
-- combat (melee+ranged), equipment, inventory, and status effects,
-- hunger, traps, resting/natural regeneration, and XP leveling,
-- save/load with v2->v3 migration support,
+- combat (melee, ranged, and spellcasting), equipment, inventory, and status effects,
+- hunger, hidden traps, resting/natural regeneration, and XP+talent progression,
+- town hub NPC interactions and save-persistent quest scaffolding,
+- save/load with backup recovery and v2->v4 migration support,
 - externalized content definitions in JSON.
 
 ## Design and Roadmap Docs
@@ -19,4 +20,4 @@ This repository currently contains a playable ADOM-inspired roguelike foundation
 
 ## Next Development Focus
 
-The next phase targets deeper ADOM parity through spellcasting/resistance systems, town+quest simulation loops, and richer procedural world content.
+The next phase targets deeper ADOM parity through advanced class progression, richer NPC/faction simulation, and deeper procedural biome/content variety.

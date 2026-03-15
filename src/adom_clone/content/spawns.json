@@ -45,21 +45,25 @@
       "hp": 8,
       "power": 3,
       "defense": 0,
-      "xp_reward": 10
+      "xp_reward": 10,
+      "poison_resist": 20
     },
     "goblin": {
       "name": "goblin",
       "hp": 12,
       "power": 4,
       "defense": 1,
-      "xp_reward": 18
+      "xp_reward": 18,
+      "physical_resist": 10
     },
     "orc": {
       "name": "orc",
       "hp": 16,
       "power": 5,
       "defense": 2,
-      "xp_reward": 24
+      "xp_reward": 24,
+      "physical_resist": 20,
+      "arcane_resist": 15
     }
   },
   "overworld_items": [

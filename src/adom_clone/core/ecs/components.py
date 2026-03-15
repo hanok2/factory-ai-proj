@@ -107,3 +107,40 @@ class RangedWeapon:
 @dataclass(slots=True)
 class ExperienceReward:
     xp: int
+
+
+class DamageType(str, Enum):
+    PHYSICAL = "physical"
+    POISON = "poison"
+    ARCANE = "arcane"
+
+
+@dataclass(slots=True)
+class Resistances:
+    physical_pct: int = 0
+    poison_pct: int = 0
+    arcane_pct: int = 0
+
+
+@dataclass(slots=True)
+class Mana:
+    current: int
+    max_value: int
+
+
+@dataclass(slots=True)
+class Talents:
+    points: int = 0
+    selected: list[str] = field(default_factory=list)
+
+
+class NpcRole(str, Enum):
+    HEALER = "healer"
+    SHOPKEEPER = "shopkeeper"
+    QUEST_GIVER = "quest_giver"
+
+
+@dataclass(slots=True)
+class Npc:
+    name: str
+    role: NpcRole

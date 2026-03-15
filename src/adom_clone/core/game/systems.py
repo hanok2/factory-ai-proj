@@ -1,6 +1,7 @@
 """Gameplay system modules used by GameSession."""
 
 import json
+import shutil
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 from adom_clone.core.ecs.components import (
     BlocksMovement,
     Consumable,
+    DamageType,
     Equipment,
     EquipmentSlot,
     Equippable,
@@ -17,23 +19,32 @@ from adom_clone.core.ecs.components import (
     Hunger,
     Inventory,
     Item,
+    Mana,
     Monster,
+    Npc,
+    NpcRole,
     OnMap,
     Player,
     Position,
     Progression,
     RangedWeapon,
+    Resistances,
     StatusEffects,
+    Talents,
 )
 from adom_clone.core.ecs.store import ECSStore
 from adom_clone.core.game.actions import (
+    CastArcaneBoltAction,
+    CastMendAction,
     DisarmTrapAction,
     DropLastItemAction,
     GameAction,
+    InteractAction,
     MoveAction,
     PickupAction,
     RangedAttackAction,
     RestAction,
+    SelectTalentAction,
     UseItemAction,
     WaitAction,
 )
@@ -80,6 +91,14 @@ class TurnSystem:
             return session.rest_player()
         if isinstance(action, DisarmTrapAction):
             return session.disarm_nearby_trap()
+        if isinstance(action, InteractAction):
+            return session.interact_with_adjacent_npc()
+        if isinstance(action, CastArcaneBoltAction):
+            return session.cast_arcane_bolt(action.dx, action.dy)
+        if isinstance(action, CastMendAction):
+            return session.cast_mend()
+        if isinstance(action, SelectTalentAction):
+            return session.select_talent(action.talent_id)
         if isinstance(action, WaitAction):
             session.add_message("You wait.")
             return True
@@ -95,24 +114,30 @@ class CombatSystem:
         if attacker_fighter is None or defender_fighter is None:
             return
 
-        damage = max(
+        base_damage = max(
             1,
             self.effective_power(session, attacker)
             - self.effective_defense(session, defender),
         )
-        defender_fighter.hp -= damage
+        actual, mitigated = session.apply_damage(
+            defender,
+            base_damage,
+            DamageType.PHYSICAL,
+            source="melee",
+        )
 
         if attacker == session.player_entity:
             monster = session.ecs.get_component(defender, Monster)
             target_name = monster.name if monster is not None else "target"
-            session.add_message(f"You hit {target_name} for {damage} damage.")
+            session.add_message(
+                f"You hit {target_name} for {actual} physical damage ({mitigated} resisted).",
+            )
         elif defender == session.player_entity:
             monster = session.ecs.get_component(attacker, Monster)
             source_name = monster.name if monster is not None else "enemy"
-            session.add_message(f"{source_name} hits you for {damage} damage.")
-
-        if defender_fighter.hp <= 0:
-            session._handle_death(defender)
+            session.add_message(
+                f"{source_name} hits you for {actual} physical damage ({mitigated} resisted).",
+            )
 
     def ranged_attack(self, session: "GameSession", dx: int, dy: int) -> bool:
         if dx == 0 and dy == 0:
@@ -148,19 +173,25 @@ class CombatSystem:
             if target_fighter is None:
                 break
 
-            damage = max(
+            base_damage = max(
                 1,
                 self.effective_power(session, session.player_entity)
                 + ranged.damage
                 - self.effective_defense(session, blocker),
             )
-            target_fighter.hp -= damage
+            actual, mitigated = session.apply_damage(
+                blocker,
+                base_damage,
+                DamageType.PHYSICAL,
+                source=item.name,
+            )
             target = session.ecs.get_component(blocker, Monster)
             target_name = "target" if target is None else target.name
-            session.add_message(f"You throw {item.name} and hit {target_name} for {damage} damage.")
+            session.add_message(
+                f"You throw {item.name} and hit {target_name} for {actual} physical damage"
+                f" ({mitigated} resisted).",
+            )
             session.consume_inventory_item(slot_index, item_entity)
-            if target_fighter.hp <= 0:
-                session._handle_death(blocker)
             return True
 
         session.add_message(f"You throw {item.name}, but hit nothing.")
@@ -431,6 +462,35 @@ class PersistenceSystem:
                     "stun": status.stun,
                 }
 
+            mana = session.ecs.get_component(entity_id, Mana)
+            if mana is not None:
+                entity_data["mana"] = {
+                    "current": mana.current,
+                    "max_value": mana.max_value,
+                }
+
+            talents = session.ecs.get_component(entity_id, Talents)
+            if talents is not None:
+                entity_data["talents"] = {
+                    "points": talents.points,
+                    "selected": [*talents.selected],
+                }
+
+            resistances = session.ecs.get_component(entity_id, Resistances)
+            if resistances is not None:
+                entity_data["resistances"] = {
+                    "physical_pct": resistances.physical_pct,
+                    "poison_pct": resistances.poison_pct,
+                    "arcane_pct": resistances.arcane_pct,
+                }
+
+            npc = session.ecs.get_component(entity_id, Npc)
+            if npc is not None:
+                entity_data["npc"] = {
+                    "name": npc.name,
+                    "role": npc.role.value,
+                }
+
             inventory = session.ecs.get_component(entity_id, Inventory)
             if inventory is not None:
                 entity_data["inventory"] = {
@@ -486,7 +546,7 @@ class PersistenceSystem:
             entities.append(entity_data)
 
         return {
-            "version": 3,
+            "version": 4,
             "seed": session.seed,
             "race_id": session.race_id,
             "class_id": session.class_id,
@@ -498,6 +558,7 @@ class PersistenceSystem:
             "turn_count": session.turn_count,
             "kill_count": session.kill_count,
             "regen_counter": session.regen_counter,
+            "quest_state": _serialize_quest_state(session),
             "trap_state": _serialize_trap_state(session),
             "entities": entities,
         }
@@ -505,13 +566,41 @@ class PersistenceSystem:
     def save_to_file(self, session: "GameSession", file_path: str) -> None:
         path = Path(file_path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Preserve previous save as a backup so corrupted writes are recoverable.
+        if path.exists():
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            shutil.copy2(path, backup_path)
+
         payload = json.dumps(self.to_save_data(session), separators=(",", ":"))
         path.write_text(payload, encoding="utf-8")
 
     def load_from_file(self, file_path: str) -> "GameSession":
         path = Path(file_path)
-        raw_data = json.loads(path.read_text(encoding="utf-8"))
-        return self.from_save_data(raw_data)
+        try:
+            raw_data = json.loads(path.read_text(encoding="utf-8"))
+            return self.from_save_data(raw_data)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            return self._load_backup_or_raise(path, exc)
+
+    def _load_backup_or_raise(self, path: Path, exc: Exception) -> "GameSession":
+        backup_path = path.with_suffix(path.suffix + ".bak")
+        if backup_path.exists():
+            try:
+                raw_backup = json.loads(backup_path.read_text(encoding="utf-8"))
+                loaded = self.from_save_data(raw_backup)
+                loaded.add_message(
+                    f"Primary save was invalid and backup was restored from {backup_path.name}.",
+                )
+                return loaded
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                pass
+
+        msg = (
+            f"Save data is corrupted: {exc}. "
+            f"No valid backup found at {backup_path.name}."
+        )
+        raise ValueError(msg) from exc
 
     def from_save_data(self, raw_data: object) -> "GameSession":
         from adom_clone.core.game.session import GameSession
@@ -541,6 +630,9 @@ class PersistenceSystem:
         session.turn_count = _expect_int(data.get("turn_count", 0), "turn_count")
         session.kill_count = _expect_int(data.get("kill_count", 0), "kill_count")
         session.regen_counter = _expect_int(data.get("regen_counter", 0), "regen_counter")
+        quest_state = data.get("quest_state")
+        if quest_state is not None:
+            _load_quest_state(session, quest_state)
         current_map_kind = MapKind(_expect_str(data.get("current_map"), "current_map"))
         current_depth_raw = data.get("current_depth")
         current_depth = (
@@ -642,6 +734,68 @@ class PersistenceSystem:
                         poison=_expect_int(status_data.get("poison", 0), "entity.status.poison"),
                         bleed=_expect_int(status_data.get("bleed", 0), "entity.status.bleed"),
                         stun=_expect_int(status_data.get("stun", 0), "entity.status.stun"),
+                    ),
+                )
+
+            raw_mana = entity_data.get("mana")
+            if raw_mana is not None:
+                mana_data = _expect_dict(raw_mana, "entity.mana")
+                session.ecs.add_component(
+                    entity_id,
+                    Mana(
+                        current=_expect_int(mana_data.get("current"), "entity.mana.current"),
+                        max_value=_expect_int(mana_data.get("max_value"), "entity.mana.max_value"),
+                    ),
+                )
+
+            raw_talents = entity_data.get("talents")
+            if raw_talents is not None:
+                talents_data = _expect_dict(raw_talents, "entity.talents")
+                selected_raw = _expect_list(
+                    talents_data.get("selected", []),
+                    "entity.talents.selected",
+                )
+                selected = [
+                    _expect_str(item, "entity.talents.selected_item")
+                    for item in selected_raw
+                ]
+                session.ecs.add_component(
+                    entity_id,
+                    Talents(
+                        points=_expect_int(talents_data.get("points", 0), "entity.talents.points"),
+                        selected=selected,
+                    ),
+                )
+
+            raw_resistances = entity_data.get("resistances")
+            if raw_resistances is not None:
+                resist_data = _expect_dict(raw_resistances, "entity.resistances")
+                session.ecs.add_component(
+                    entity_id,
+                    Resistances(
+                        physical_pct=_expect_int(
+                            resist_data.get("physical_pct", 0),
+                            "entity.resistances.physical_pct",
+                        ),
+                        poison_pct=_expect_int(
+                            resist_data.get("poison_pct", 0),
+                            "entity.resistances.poison_pct",
+                        ),
+                        arcane_pct=_expect_int(
+                            resist_data.get("arcane_pct", 0),
+                            "entity.resistances.arcane_pct",
+                        ),
+                    ),
+                )
+
+            raw_npc = entity_data.get("npc")
+            if raw_npc is not None:
+                npc_data = _expect_dict(raw_npc, "entity.npc")
+                session.ecs.add_component(
+                    entity_id,
+                    Npc(
+                        name=_expect_str(npc_data.get("name"), "entity.npc.name"),
+                        role=NpcRole(_expect_str(npc_data.get("role"), "entity.npc.role")),
                     ),
                 )
 
@@ -774,6 +928,9 @@ class PersistenceSystem:
         if current_map_kind == MapKind.OVERWORLD:
             session.current_map = session.overworld
             session.current_depth = None
+        elif current_map_kind == MapKind.TOWN:
+            session.current_map = session.town
+            session.current_depth = None
         else:
             dungeon_depth = 1 if current_depth is None else current_depth
             session.current_map = session.dungeon_levels[dungeon_depth - 1]
@@ -792,6 +949,7 @@ class PersistenceSystem:
         _ensure_status_components(session)
         _ensure_progression_component(session)
         _ensure_monster_xp_rewards(session)
+        _ensure_phase6_components(session)
 
         _ = session.player_position
         _ = session.player_fighter
@@ -799,18 +957,28 @@ class PersistenceSystem:
         _ = session.player_hunger
         _ = session.player_equipment
         _ = session.player_progression
+        _ = session.player_mana
+        _ = session.player_talents
+        _ = session.player_resistances
         return session
 
 
 def _serialize_trap_state(session: "GameSession") -> dict[str, object]:
     dungeon: dict[str, list[list[int]]] = {}
+    dungeon_discovered: dict[str, list[list[int]]] = {}
     for tile_map in session.dungeon_levels:
         coords = sorted(tile_map.trap_positions)
         dungeon[str(tile_map.depth)] = [[x, y] for x, y in coords]
+        discovered = sorted(tile_map.discovered_traps)
+        dungeon_discovered[str(tile_map.depth)] = [[x, y] for x, y in discovered]
 
     return {
         "overworld": [[x, y] for x, y in sorted(session.overworld.trap_positions)],
+        "overworld_discovered": [[x, y] for x, y in sorted(session.overworld.discovered_traps)],
+        "town": [[x, y] for x, y in sorted(session.town.trap_positions)],
+        "town_discovered": [[x, y] for x, y in sorted(session.town.discovered_traps)],
         "dungeon": dungeon,
+        "dungeon_discovered": dungeon_discovered,
     }
 
 
@@ -818,8 +986,28 @@ def _load_trap_state(session: "GameSession", raw: object) -> None:
     data = _expect_dict(raw, "trap_state")
     overworld_raw = _expect_list(data.get("overworld", []), "trap_state.overworld")
     session.overworld.trap_positions = _coords_set(overworld_raw, "trap_state.overworld")
+    overworld_discovered_raw = _expect_list(
+        data.get("overworld_discovered", []),
+        "trap_state.overworld_discovered",
+    )
+    session.overworld.discovered_traps = _coords_set(
+        overworld_discovered_raw,
+        "trap_state.overworld_discovered",
+    )
+
+    town_raw = _expect_list(data.get("town", []), "trap_state.town")
+    session.town.trap_positions = _coords_set(town_raw, "trap_state.town")
+    town_discovered_raw = _expect_list(
+        data.get("town_discovered", []),
+        "trap_state.town_discovered",
+    )
+    session.town.discovered_traps = _coords_set(town_discovered_raw, "trap_state.town_discovered")
 
     dungeon_raw = _expect_dict(data.get("dungeon", {}), "trap_state.dungeon")
+    dungeon_discovered_raw = _expect_dict(
+        data.get("dungeon_discovered", {}),
+        "trap_state.dungeon_discovered",
+    )
     for depth_text, coords_raw in dungeon_raw.items():
         depth = _expect_int(depth_text_to_int(depth_text), "trap_state.dungeon.depth")
         if depth < 1 or depth > len(session.dungeon_levels):
@@ -829,16 +1017,72 @@ def _load_trap_state(session: "GameSession", raw: object) -> None:
             coords_list,
             f"trap_state.dungeon.{depth}",
         )
+        discovered_coords_raw = _expect_list(
+            dungeon_discovered_raw.get(depth_text, []),
+            f"trap_state.dungeon_discovered.{depth}",
+        )
+        session.dungeon_levels[depth - 1].discovered_traps = _coords_set(
+            discovered_coords_raw,
+            f"trap_state.dungeon_discovered.{depth}",
+        )
+
+
+def _serialize_quest_state(session: "GameSession") -> dict[str, object]:
+    quest = session.quest_state
+    return {
+        "quest_id": quest.quest_id,
+        "accepted": quest.accepted,
+        "target_kills": quest.target_kills,
+        "completed": quest.completed,
+        "turned_in": quest.turned_in,
+    }
+
+
+def _load_quest_state(session: "GameSession", raw: object) -> None:
+    data = _expect_dict(raw, "quest_state")
+    session.quest_state.quest_id = _expect_str(
+        data.get("quest_id", "town_goblin_cull"),
+        "quest_state.quest_id",
+    )
+    session.quest_state.accepted = _expect_bool(
+        data.get("accepted", False),
+        "quest_state.accepted",
+    )
+    session.quest_state.target_kills = _expect_int(
+        data.get("target_kills", 3),
+        "quest_state.target_kills",
+    )
+    session.quest_state.completed = _expect_bool(
+        data.get("completed", False),
+        "quest_state.completed",
+    )
+    session.quest_state.turned_in = _expect_bool(
+        data.get("turned_in", False),
+        "quest_state.turned_in",
+    )
 
 
 def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
     version = _expect_int(data.get("version", 2), "version")
-    if version == 3:
+    if version == 4:
         return data
     if version == 2:
         migrated = dict(data)
         migrated["version"] = 3
         migrated.setdefault("regen_counter", 0)
+        version = 3
+        data = migrated
+
+    if version == 3:
+        migrated = dict(data)
+        migrated["version"] = 4
+        migrated.setdefault("quest_state", {
+            "quest_id": "town_goblin_cull",
+            "accepted": False,
+            "target_kills": 3,
+            "completed": False,
+            "turned_in": False,
+        })
         return migrated
 
     msg = f"Unsupported save version: {version}"
@@ -871,6 +1115,29 @@ def _ensure_monster_xp_rewards(session: "GameSession") -> None:
     for entity_id, _ in session.ecs.entities_with(Monster):
         if session.ecs.get_component(entity_id, ExperienceReward) is None:
             session.ecs.add_component(entity_id, ExperienceReward(xp=10))
+
+
+def _ensure_phase6_components(session: "GameSession") -> None:
+    """Backfill Phase 6 components when loading older saves."""
+    if session.ecs.get_component(session.player_entity, Mana) is None:
+        session.ecs.add_component(
+            session.player_entity,
+            Mana(
+                current=session.character_class.mana_base,
+                max_value=session.character_class.mana_base,
+            ),
+        )
+    if session.ecs.get_component(session.player_entity, Talents) is None:
+        session.ecs.add_component(session.player_entity, Talents())
+    if session.ecs.get_component(session.player_entity, Resistances) is None:
+        session.ecs.add_component(session.player_entity, Resistances())
+
+    for entity_id, _monster in session.ecs.entities_with(Monster):
+        if session.ecs.get_component(entity_id, Resistances) is None:
+            session.ecs.add_component(entity_id, Resistances())
+
+    if not session.ecs.entities_with(Npc):
+        session._spawn_town_npcs()
 
 
 def _coords_set(raw_list: list[object], field_name: str) -> set[tuple[int, int]]:

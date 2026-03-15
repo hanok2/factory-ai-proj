@@ -30,6 +30,10 @@ class ClassDefinition:
     hp_per_level: int
     power_every: int
     defense_every: int
+    mana_base: int
+    mana_per_level: int
+    talent_milestones: tuple[int, ...]
+    starting_spells: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,9 @@ class MonsterTemplate:
     power: int
     defense: int
     xp_reward: int
+    physical_resist: int
+    poison_resist: int
+    arcane_resist: int
 
 
 @dataclass(frozen=True)
@@ -140,6 +147,13 @@ def _parse_class(raw: object) -> ClassDefinition:
     data = _expect_dict(raw, "class")
     starting_items_raw = _expect_list(data.get("starting_items"), "class.starting_items")
     starting_items = tuple(_expect_str(item, "class.starting_item") for item in starting_items_raw)
+    milestones_raw = _expect_list(
+        data.get("talent_milestones", [3, 5, 7]),
+        "class.talent_milestones",
+    )
+    milestones = tuple(_expect_int(item, "class.talent_milestone") for item in milestones_raw)
+    spells_raw = _expect_list(data.get("starting_spells", []), "class.starting_spells")
+    starting_spells = tuple(_expect_str(item, "class.starting_spell") for item in spells_raw)
     return ClassDefinition(
         id=_expect_str(data.get("id"), "class.id"),
         name=_expect_str(data.get("name"), "class.name"),
@@ -151,6 +165,10 @@ def _parse_class(raw: object) -> ClassDefinition:
         hp_per_level=_expect_int(data.get("hp_per_level", 2), "class.hp_per_level"),
         power_every=_expect_int(data.get("power_every", 2), "class.power_every"),
         defense_every=_expect_int(data.get("defense_every", 3), "class.defense_every"),
+        mana_base=_expect_int(data.get("mana_base", 8), "class.mana_base"),
+        mana_per_level=_expect_int(data.get("mana_per_level", 1), "class.mana_per_level"),
+        talent_milestones=milestones,
+        starting_spells=starting_spells,
     )
 
 
@@ -208,6 +226,18 @@ def _parse_monster_template(template_id: str, raw: object) -> MonsterTemplate:
         xp_reward=_expect_int(
             data.get("xp_reward", 10),
             f"monster_templates.{template_id}.xp_reward",
+        ),
+        physical_resist=_expect_int(
+            data.get("physical_resist", 0),
+            f"monster_templates.{template_id}.physical_resist",
+        ),
+        poison_resist=_expect_int(
+            data.get("poison_resist", 0),
+            f"monster_templates.{template_id}.poison_resist",
+        ),
+        arcane_resist=_expect_int(
+            data.get("arcane_resist", 0),
+            f"monster_templates.{template_id}.arcane_resist",
         ),
     )
 

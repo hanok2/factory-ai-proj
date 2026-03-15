@@ -1,173 +1,147 @@
-# ADOM-Clone Current Design (Phase 5 Foundation)
+# ADOM-Clone Current Design (Phase 6 Implementation)
 
 ## 1. Scope of the Current Build
 
-The current build is a **Phase 5 foundation milestone** that extends the ADOM-oriented scaffold into basic tactical and progression play.
+The project now includes the full **Phase 6 sprint cut** on top of the Phase 5 baseline.
 
-Implemented baseline features:
+Implemented highlights:
 
-- ECS component model with dedicated gameplay systems,
-- overworld + multi-depth dungeon traversal,
-- character creation (race/class/seed),
-- turn-based combat, equipment, inventory interactions,
-- ranged projectile attacks with directional targeting,
-- hunger and food consumption loop,
-- status effects (poison/bleed/stun),
-- trap trigger/disarm interactions,
-- resting and natural regeneration,
-- XP and level progression with class growth rules,
-- deterministic seeded initialization,
-- save/load with schema migration (`v2 -> v3`) and expanded metadata.
+- modular ECS-driven runtime (`Turn`, `Combat`, `Inventory`, `AI`, `Persistence`),
+- overworld + town hub + multi-depth dungeon world structure,
+- character creation and class/race/seed-driven starts,
+- melee + ranged + spellcasting (Arcane Bolt + Mend),
+- typed damage and resistance mitigation logging,
+- XP leveling plus talent point milestones and talent selection,
+- town NPC services (healer/shopkeeper/quest giver),
+- hidden trap discovery + disarm flow,
+- save migration to schema v4 with backup fallback and corruption diagnostics.
 
 ## 2. Runtime Architecture
 
 ## 2.1 Layering
 
 - **Core domain (`src/adom_clone/core`)**
-  - ECS store and components,
-  - world map models/generators,
-  - gameplay systems (`TurnSystem`, `CombatSystem`, `InventorySystem`, `AISystem`, `PersistenceSystem`),
-  - session orchestration (`GameSession`) and content loading.
+  - ECS components and store,
+  - map models/generators,
+  - game systems and `GameSession` orchestration.
 - **Content (`src/adom_clone/content`)**
-  - JSON configuration for character options and spawn/template definitions.
+  - class/race, spawn, and template data in JSON.
 - **Client (`src/adom_clone/client`)**
-  - pygame loop, input mapping, character creation screen, rendering and HUD.
+  - pygame input loop, render layers, HUD/modals.
 
-## 2.2 ECS + Systems
+## 2.2 Core Components Added in Phase 6
 
-- **Entity**: integer ID (`ECSStore.create_entity`).
-- **Components**: data-only structs (position, fighter, hunger, equipment, item traits, etc.).
-- **Systems**:
-  - `TurnSystem`: action dispatch + turn progression,
-  - `CombatSystem`: damage/effective stats/death processing,
-  - `InventorySystem`: pickup/use/equip/drop/eat,
-  - `AISystem`: simple chase-and-attack behavior,
-  - `PersistenceSystem`: session serialization/deserialization.
+- `Mana`
+- `Talents`
+- `Resistances`
+- `Npc` + `NpcRole`
+- `DamageType` enum
+- `QuestState` (session-level run state)
 
-`GameSession` now coordinates systems and map/content lifecycle rather than containing all rule logic inline.
+## 3. World Model
 
-## 3. World and Progression Model
+- **Overworld**
+  - contains dungeon entrance and town entry tile.
+- **Town**
+  - contains service NPCs and quest-giver interactions.
+- **Dungeon Levels**
+  - maintain depth-indexed stairs and trap state.
 
-- **Overworld** contains a dungeon entrance.
-- **Dungeons** are generated as `dungeon_levels[1..N]` with up/down transitions:
-  - descend from overworld to level 1,
-  - descend via `stairs_down_pos` to deeper levels,
-  - ascend via `exit_pos` toward shallower levels,
-  - ascend from level 1 back to overworld.
+Transition graph:
 
-Depth context is tracked in both map state and `OnMap.depth` entity component.
+- overworld <-> town
+- overworld <-> dungeon level 1
+- dungeon depth N <-> N+1 via stairs
 
-## 4. Character and Build Initialization
+## 4. Progression + Talent Layer
 
-- Character options are loaded from `character_options.json`.
-- Player chooses:
-  - race,
-  - class,
-  - deterministic seed.
-- Class and race combine to derive starting HP/power/defense and hunger cap.
-- Starting loadout is data-driven and can include equippable gear, food, and consumables.
+- XP is granted via `ExperienceReward` on monster death.
+- Level-up grants stat growth (HP/power/defense/mana scaling by class).
+- Talent points are granted at class-defined milestone levels.
+- Talent selection is explicit and persistent.
 
-## 5. Combat, Equipment, Inventory, Hunger
+Current talents:
 
-## 5.1 Combat
+- `arcane_efficiency` (reduced spell costs)
+- `keen_senses` (better hidden trap detection)
+- `hardened` (+physical resistance)
 
-- Movement into hostile blockers resolves as melee attack.
-- Effective combat values include equipment bonuses:
-  - weapon -> power bonus,
-  - armor -> defense bonus.
-- Ranged attacks are supported through projectile items and directional targeting mode.
-- Status hooks support poison/bleed damage-over-time and stun turn loss.
+## 5. Combat and Magic
 
-## 5.2 Equipment
+## 5.1 Damage Typing
 
-- Slots currently implemented:
-  - weapon,
-  - armor.
-- `UseItemAction` toggles equip/unequip for equippable items.
+Damage now carries type (`physical`, `poison`, `arcane`) and is resolved through resistance mitigation.
 
-## 5.3 Inventory
+Combat log messaging exposes dealt and resisted damage for player-facing clarity.
 
-- Supports pickup, slot-based use (`1..9`), and drop-last.
-- Use behavior branches by item traits:
-  - healing consumable,
-  - food,
-  - equippable.
+## 5.2 Spellcasting Baseline
 
-## 5.4 Hunger
+- **Arcane Bolt**: directional projectile spell (mana cost + arcane damage).
+- **Mend**: utility self-heal spell.
 
-- Hunger decreases per acted turn.
-- Threshold messages provide player feedback.
-- Starvation deals HP damage and can cause death.
+Mana regenerates over time; spell costs can be modified by talents.
 
-## 5.5 Resting and Regeneration
+## 6. Town NPC + Quest Scaffold
 
-- `RestAction` restores HP when no adjacent monster is threatening the player.
-- Natural regeneration restores HP periodically while out of immediate danger.
+Town includes three role-based NPC interactions:
 
-## 5.6 Traps
+- **Quest giver**: starts and resolves a kill-target quest chain,
+- **Healer**: restores HP/mana and clears statuses,
+- **Shopkeeper**: provides baseline supplies.
 
-- Dungeons now generate active trap positions.
-- Traps can be disarmed and can trigger damage + status effects.
+Quest state is serialized and restored across save/load.
 
-## 6. Persistence and Determinism
+## 7. Hidden Trap System
 
-- Save schema now includes:
-  - `version`,
-  - `seed`, `race_id`, `class_id`,
-  - dungeon depth context,
-  - trap state snapshots,
-  - regen counter,
-  - run metrics (`turn_count`, `kill_count`),
-  - full component reconstruction payload.
-- Rehydration validates key shapes/types, rebuilds ECS state, and migrates v2 saves to v3.
+- Traps are tracked separately as hidden vs discovered.
+- Trap perception runs each turn with deterministic detection checks.
+- Adjacent traps are reliably discoverable.
+- Only discovered traps are rendered in HUD map layer.
 
-## 7. Client/UI State
+## 8. Persistence and Recovery
 
-Current client supports:
+Current save schema is **version 4**.
 
-- character creation UI (race/class/seed),
-- map + entity rendering,
-- HUD with HP/hunger/power/defense/turns/kills,
-- inventory display with equipped markers,
-- targeting mode for ranged attacks,
-- character sheet modal with build metadata,
-- save/load/new-run hotkeys.
+Persistence includes:
 
-## 8. Test Coverage Snapshot
+- quest state,
+- town state,
+- trap hidden/discovered state,
+- phase 6 components (mana/talents/resistances/NPCs).
 
-Current automated tests verify:
+Reliability behavior:
 
-- ECS component lifecycle,
-- overworld <-> dungeon transitions and depth movement,
-- combat interactions,
-- progression and XP leveling,
-- ranged attack behavior,
-- rest and trap interactions,
-- v2 -> v3 save migration,
-- inventory/heal/food/equipment behavior,
-- save/load round-trip and metadata persistence.
+- saves create `.bak` backups when overwriting,
+- corrupted primary saves attempt backup recovery,
+- diagnostics are surfaced when recovery is not possible.
 
-Validation pipeline: `pytest`, `ruff`, `mypy`.
+## 9. Client/UI State
 
-## 9. Current Constraints / Gaps
+UI now includes:
 
-Despite this Phase 5 progress, ADOM parity is still far from complete. Major gaps:
+- ranged targeting mode,
+- spell targeting mode,
+- talent selection modal,
+- expanded character sheet (mana/talents/spells/quest),
+- interact command for NPC services.
 
-- no deep skill/talent trees or attribute training,
-- no spellcasting system and limited status variety,
-- no corruption/piety/alignment systems,
-- no quest/faction/NPC economy loops,
-- no robust biome diversity, vaults, or secret mechanics,
-- no long-run world simulation (time/region consequences).
+## 10. Test Coverage Snapshot
 
-## 10. Next Phase Direction (Phase 6)
+Automated coverage now validates:
 
-To move toward ADOM parity, the next implementation phase should prioritize:
+- progression + talent selection,
+- arcane spellcasting + mana usage,
+- town interaction and quest activation,
+- hidden trap discovery,
+- corrupted-save fallback to backup,
+- all previous combat/inventory/transition/save foundations.
 
-1. **Deep progression** (talents/skills and milestone choices beyond basic leveling).
-2. **Expanded tactical combat** (spellcasting, resistances, and richer status ecosystem).
-3. **World simulation systems** (town services, quests, faction/NPC state).
-4. **Procedural expansion** (biomes, vaults, secret content, richer encounter tables).
-5. **Persistence hardening** (backup/corruption handling and richer run manifest data).
+## 11. Remaining Gaps After Phase 6
 
-This sequencing preserves current architecture while unlocking higher-value ADOM mechanics incrementally.
+Major ADOM-parity gaps still open:
+
+- deep class progression trees and skill training,
+- richer spell/status ecosystems and advanced AI roles,
+- multi-quest/faction/world-reaction simulation,
+- broader procgen diversity (biomes, vaults, secrets),
+- long-run systems (corruption/piety/alignment, economy depth).

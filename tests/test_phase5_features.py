@@ -105,12 +105,14 @@ def test_disarm_and_trigger_trap_interactions() -> None:
 
     trap_pos = (px + 1, py)
     session.current_map.trap_positions = {trap_pos}
+    session.current_map.discovered_traps = {trap_pos}
 
     session.queue_action(DisarmTrapAction())
     session.advance_turn()
     assert trap_pos not in session.current_map.trap_positions
 
     session.current_map.trap_positions = {trap_pos}
+    session.current_map.discovered_traps = set()
     hp_before = session.player_fighter.hp
     session.queue_action(MoveAction(1, 0))
     session.advance_turn()
@@ -137,4 +139,4 @@ def test_load_v2_save_migrates_to_v3() -> None:
 
     loaded = GameSession.from_save_data(save_data)
     assert loaded.player_progression.level >= 1
-    assert loaded.to_save_data()["version"] == 3
+    assert loaded.to_save_data()["version"] == 4

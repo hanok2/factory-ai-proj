@@ -6,13 +6,17 @@ from collections.abc import Iterable
 import pygame
 
 from adom_clone.core.game.actions import (
+    CastArcaneBoltAction,
+    CastMendAction,
     DisarmTrapAction,
     DropLastItemAction,
     GameAction,
+    InteractAction,
     MoveAction,
     PickupAction,
     RangedAttackAction,
     RestAction,
+    SelectTalentAction,
     UseItemAction,
     WaitAction,
 )
@@ -24,6 +28,7 @@ PLAYER_COLOR = (245, 220, 90)
 MONSTER_COLOR = (180, 60, 60)
 ITEM_COLOR = (90, 200, 220)
 TRAP_COLOR = (205, 80, 205)
+NPC_COLOR = (70, 200, 120)
 TEXT_COLOR = (230, 230, 230)
 BACKGROUND = (10, 10, 12)
 DEFAULT_SAVE_FILE = "savegame.json"
@@ -33,7 +38,7 @@ CREATION_SIZE = (900, 620)
 def run_game() -> None:
     """Run the interactive client loop."""
     pygame.init()
-    pygame.display.set_caption("ADOM Clone - Phase 3")
+    pygame.display.set_caption("ADOM Clone - Phase 6")
 
     creation_screen = pygame.display.set_mode(CREATION_SIZE)
     selection = _character_creation_screen(creation_screen)
@@ -50,7 +55,9 @@ def run_game() -> None:
 
     running = True
     targeting_mode = False
+    spell_targeting_mode = False
     show_sheet = False
+    show_talents = False
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -61,13 +68,30 @@ def run_game() -> None:
                         targeting_mode = False
                         session.add_message("Targeting cancelled.")
                         continue
+                    if spell_targeting_mode:
+                        spell_targeting_mode = False
+                        session.add_message("Spell targeting cancelled.")
+                        continue
                     if show_sheet:
                         show_sheet = False
+                        continue
+                    if show_talents:
+                        show_talents = False
                         continue
                     running = False
 
                 if event.key == pygame.K_c:
                     show_sheet = not show_sheet
+                    continue
+
+                if event.key == pygame.K_t:
+                    show_talents = not show_talents
+                    continue
+
+                if show_talents:
+                    maybe_talent = _talent_action_for_key(event.key, session)
+                    if maybe_talent is not None:
+                        session.queue_action(maybe_talent)
                     continue
 
                 if targeting_mode:
@@ -77,9 +101,25 @@ def run_game() -> None:
                         targeting_mode = False
                     continue
 
+                if spell_targeting_mode:
+                    maybe_spell = _spell_direction_action_for_key(event.key)
+                    if maybe_spell is not None:
+                        session.queue_action(maybe_spell)
+                        spell_targeting_mode = False
+                    continue
+
                 if event.key == pygame.K_f:
                     targeting_mode = True
                     session.add_message("Targeting mode: choose a direction.")
+                    continue
+
+                if event.key == pygame.K_z:
+                    spell_targeting_mode = True
+                    session.add_message("Spell targeting mode: choose a direction for Arcane Bolt.")
+                    continue
+
+                if event.key == pygame.K_h:
+                    session.queue_action(CastMendAction())
                     continue
 
                 if event.key == pygame.K_F5:
@@ -115,7 +155,15 @@ def run_game() -> None:
                     session.queue_action(maybe_action)
 
         session.advance_turn()
-        _draw(screen, font, session, show_sheet, targeting_mode)
+        _draw(
+            screen,
+            font,
+            session,
+            show_sheet,
+            show_talents,
+            targeting_mode,
+            spell_targeting_mode,
+        )
         pygame.display.flip()
         clock.tick(60)
 
@@ -127,7 +175,9 @@ def _draw(
     font: pygame.font.Font,
     session: GameSession,
     show_sheet: bool,
+    show_talents: bool,
     targeting_mode: bool,
+    spell_targeting_mode: bool,
 ) -> None:
     """Draw map tiles, entities, and HUD."""
     screen.fill(BACKGROUND)
@@ -161,6 +211,10 @@ def _draw(
         monster_rect = pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
         pygame.draw.rect(screen, MONSTER_COLOR, monster_rect)
 
+    for x, y in session.npc_positions():
+        npc_rect = pygame.Rect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
+        pygame.draw.rect(screen, NPC_COLOR, npc_rect)
+
     pos = session.player_position
     player_rect = pygame.Rect(pos.x * TILE_SIZE, pos.y * TILE_SIZE, TILE_SIZE, TILE_SIZE)
     pygame.draw.rect(screen, PLAYER_COLOR, player_rect)
@@ -168,13 +222,17 @@ def _draw(
     hud_y = tile_map.height * TILE_SIZE
     pygame.draw.rect(screen, (20, 20, 24), pygame.Rect(0, hud_y, screen.get_width(), HUD_HEIGHT))
     map_name = (
-        tile_map.kind.value
+        "overworld"
         if tile_map.kind == session.overworld.kind
-        else f"dungeon:{session.current_depth or 1}/{session.dungeon_level_count}"
+        else (
+            "town"
+            if tile_map.kind.value == "town"
+            else f"dungeon:{session.current_depth or 1}/{session.dungeon_level_count}"
+        )
     )
     map_line = (
         f"Map: {map_name} | HP: {session.player_hp_text} "
-        f"| Hunger: {session.player_hunger_text}"
+        f"| Mana: {session.player_mana_text} | Hunger: {session.player_hunger_text}"
     )
     stats_line = (
         f"Power: {session.player_power} | Defense: {session.player_defense} "
@@ -182,19 +240,32 @@ def _draw(
     )
     controls_line = (
         "Move: WASD/Arrows | G:pickup | 1-9:use/equip/eat | "
-        "F:target | V:rest | X:disarm | R:drop | C:sheet"
+        "F:throw | Z:bolt | H:mend | E:interact | V:rest | X:disarm"
     )
-    save_line = "F5: save | F9: load | ESC: quit"
+    save_line = "R:drop | C:sheet | T:talents | F5: save | F9: load | ESC: quit"
     inventory_line = _inventory_line(session)
-    lines = [map_line, stats_line, controls_line, save_line, inventory_line, *session.messages[-2:]]
+    quest_line = session.quest_text
+    lines = [
+        map_line,
+        stats_line,
+        controls_line,
+        save_line,
+        inventory_line,
+        quest_line,
+        *session.messages[-2:],
+    ]
     if targeting_mode:
         lines.append("Targeting mode active: press a movement direction to throw.")
+    if spell_targeting_mode:
+        lines.append("Spell targeting active: press a movement direction for Arcane Bolt.")
     if session.game_over:
         lines.append("Game over. Press ESC to quit.")
     _blit_lines(screen, font, lines, hud_y + 8)
 
     if show_sheet:
         _draw_character_sheet(screen, font, session)
+    if show_talents:
+        _draw_talent_panel(screen, font, session)
 
 
 def _inventory_line(session: GameSession) -> str:
@@ -235,6 +306,8 @@ def _action_for_key(key: int) -> GameAction | None:
         return RestAction()
     if key == pygame.K_x:
         return DisarmTrapAction()
+    if key == pygame.K_e:
+        return InteractAction()
     if key == pygame.K_r:
         return DropLastItemAction()
     if key in (pygame.K_PERIOD, pygame.K_SPACE):
@@ -253,6 +326,30 @@ def _ranged_action_for_key(key: int) -> RangedAttackAction | None:
         return RangedAttackAction(-1, 0)
     if key in (pygame.K_d, pygame.K_RIGHT):
         return RangedAttackAction(1, 0)
+    return None
+
+
+def _spell_direction_action_for_key(key: int) -> CastArcaneBoltAction | None:
+    if key in (pygame.K_w, pygame.K_UP):
+        return CastArcaneBoltAction(0, -1)
+    if key in (pygame.K_s, pygame.K_DOWN):
+        return CastArcaneBoltAction(0, 1)
+    if key in (pygame.K_a, pygame.K_LEFT):
+        return CastArcaneBoltAction(-1, 0)
+    if key in (pygame.K_d, pygame.K_RIGHT):
+        return CastArcaneBoltAction(1, 0)
+    return None
+
+
+def _talent_action_for_key(key: int, session: GameSession) -> SelectTalentAction | None:
+    # Talent selection uses a deterministic index mapping to the currently available options.
+    options = session.available_talent_options()
+    if not options:
+        return None
+    if pygame.K_1 <= key <= pygame.K_9:
+        idx = key - pygame.K_1
+        if idx < len(options):
+            return SelectTalentAction(options[idx][0])
     return None
 
 
@@ -280,14 +377,42 @@ def _draw_character_sheet(
         f"Class: {session.character_class.name}",
         f"Seed: {session.seed}",
         f"{session.player_level_text}",
+        f"Mana: {session.player_mana_text}",
         f"HP: {session.player_hp_text}",
         f"Hunger: {session.player_hunger_text}",
         f"Power: {session.player_power}",
         f"Defense: {session.player_defense}",
+        f"{session.spellbook_text}",
+        f"{session.player_talents_text}",
+        f"{session.quest_text}",
         f"Weapon: {weapon_name}",
         f"Armor: {armor_name}",
         f"Turns: {session.turn_count} | Kills: {session.kill_count}",
     ]
+    _blit_lines(screen, font, lines, panel.y + 12)
+
+
+def _draw_talent_panel(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    session: GameSession,
+) -> None:
+    panel = pygame.Rect(80, 80, screen.get_width() - 160, screen.get_height() - 160)
+    pygame.draw.rect(screen, (14, 14, 18), panel)
+    pygame.draw.rect(screen, (180, 190, 230), panel, width=2)
+
+    options = session.available_talent_options()
+    lines = [
+        "Talent Selection (T to close)",
+        f"Points available: {session.player_talents.points}",
+        "Press 1-9 to choose an available talent.",
+        "",
+    ]
+    for idx, (talent_id, description) in enumerate(options[:9], start=1):
+        lines.append(f"{idx}. {talent_id} - {description}")
+    if not options:
+        lines.append("No talents available.")
+
     _blit_lines(screen, font, lines, panel.y + 12)
 
 

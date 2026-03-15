@@ -5,10 +5,13 @@ from adom_clone.core.world.map_model import MapKind, Tile, TileMap
 GRASS = Tile(passable=True, color=(60, 140, 70), name="grass")
 MOUNTAIN = Tile(passable=False, color=(80, 80, 80), name="mountain")
 DUNGEON_ENTRANCE = Tile(passable=True, color=(120, 70, 30), name="dungeon_entrance")
+TOWN_GATE = Tile(passable=True, color=(150, 120, 80), name="town_gate")
 FLOOR = Tile(passable=True, color=(70, 70, 90), name="floor")
 WALL = Tile(passable=False, color=(40, 40, 50), name="wall")
 STAIRS_UP = Tile(passable=True, color=(170, 170, 90), name="stairs_up")
 STAIRS_DOWN = Tile(passable=True, color=(90, 170, 170), name="stairs_down")
+TOWN_FLOOR = Tile(passable=True, color=(95, 75, 60), name="town_floor")
+TOWN_WALL = Tile(passable=False, color=(70, 55, 45), name="town_wall")
 
 
 def generate_overworld(width: int = 40, height: int = 24) -> TileMap:
@@ -25,12 +28,40 @@ def generate_overworld(width: int = 40, height: int = 24) -> TileMap:
     ex, ey = entrance_pos
     tiles[ey][ex] = DUNGEON_ENTRANCE
 
+    town_pos = (5, height // 2)
+    tx, ty = town_pos
+    tiles[ty][tx] = TOWN_GATE
+
     return TileMap(
         kind=MapKind.OVERWORLD,
         width=width,
         height=height,
         tiles=tiles,
         entrance_pos=entrance_pos,
+        town_pos=town_pos,
+    )
+
+
+def generate_town(width: int = 24, height: int = 16) -> TileMap:
+    tiles = [[TOWN_FLOOR for _ in range(width)] for _ in range(height)]
+
+    for x in range(width):
+        tiles[0][x] = TOWN_WALL
+        tiles[height - 1][x] = TOWN_WALL
+    for y in range(height):
+        tiles[y][0] = TOWN_WALL
+        tiles[y][width - 1] = TOWN_WALL
+
+    exit_pos = (1, height // 2)
+    ex, ey = exit_pos
+    tiles[ey][ex] = TOWN_GATE
+
+    return TileMap(
+        kind=MapKind.TOWN,
+        width=width,
+        height=height,
+        tiles=tiles,
+        exit_pos=exit_pos,
     )
 
 

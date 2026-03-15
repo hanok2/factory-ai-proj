@@ -45,3 +45,24 @@ class DisarmTrapAction(GameAction):
 class RangedAttackAction(GameAction):
     dx: int
     dy: int
+
+
+@dataclass(slots=True)
+class InteractAction(GameAction):
+    pass
+
+
+@dataclass(slots=True)
+class CastArcaneBoltAction(GameAction):
+    dx: int
+    dy: int
+
+
+@dataclass(slots=True)
+class CastMendAction(GameAction):
+    pass
+
+
+@dataclass(slots=True)
+class SelectTalentAction(GameAction):
+    talent_id: str

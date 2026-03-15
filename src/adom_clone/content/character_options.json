@@ -36,7 +36,11 @@
       "xp_base": 20,
       "hp_per_level": 3,
       "power_every": 2,
-      "defense_every": 3
+      "defense_every": 3,
+      "mana_base": 6,
+      "mana_per_level": 1,
+      "talent_milestones": [3, 6, 9],
+      "starting_spells": ["mend"]
     },
     {
       "id": "thief",
@@ -48,7 +52,11 @@
       "xp_base": 18,
       "hp_per_level": 2,
       "power_every": 3,
-      "defense_every": 3
+      "defense_every": 3,
+      "mana_base": 8,
+      "mana_per_level": 1,
+      "talent_milestones": [3, 5, 8],
+      "starting_spells": ["arcane_bolt"]
     },
     {
       "id": "wizard",
@@ -60,7 +68,11 @@
       "xp_base": 16,
       "hp_per_level": 2,
       "power_every": 2,
-      "defense_every": 4
+      "defense_every": 4,
+      "mana_base": 12,
+      "mana_per_level": 2,
+      "talent_milestones": [2, 4, 6, 8],
+      "starting_spells": ["arcane_bolt", "mend"]
     }
   ]
 }
