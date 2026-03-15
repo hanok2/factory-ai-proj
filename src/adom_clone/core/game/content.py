@@ -34,6 +34,7 @@ class ClassDefinition:
     mana_per_level: int
     talent_milestones: tuple[int, ...]
     starting_spells: tuple[str, ...]
+    school_mastery: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,14 @@ def _parse_class(raw: object) -> ClassDefinition:
     milestones = tuple(_expect_int(item, "class.talent_milestone") for item in milestones_raw)
     spells_raw = _expect_list(data.get("starting_spells", []), "class.starting_spells")
     starting_spells = tuple(_expect_str(item, "class.starting_spell") for item in spells_raw)
+    school_mastery_raw = _expect_dict(data.get("school_mastery", {}), "class.school_mastery")
+    school_mastery = {
+        _expect_str(key, "class.school_mastery.key"): _expect_int(
+            value,
+            "class.school_mastery.value",
+        )
+        for key, value in school_mastery_raw.items()
+    }
     return ClassDefinition(
         id=_expect_str(data.get("id"), "class.id"),
         name=_expect_str(data.get("name"), "class.name"),
@@ -169,6 +178,7 @@ def _parse_class(raw: object) -> ClassDefinition:
         mana_per_level=_expect_int(data.get("mana_per_level", 1), "class.mana_per_level"),
         talent_milestones=milestones,
         starting_spells=starting_spells,
+        school_mastery=school_mastery,
     )
 
 

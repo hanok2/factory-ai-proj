@@ -22,10 +22,13 @@ class TileMap:
     height: int
     tiles: list[list[Tile]]
     depth: int = 0
+    biome: str = "default"
+    room_archetype: str = "chamber"
     entrance_pos: tuple[int, int] | None = None
     town_pos: tuple[int, int] | None = None
     exit_pos: tuple[int, int] | None = None
     stairs_down_pos: tuple[int, int] | None = None
+    vault_pos: tuple[int, int] | None = None
     trap_positions: set[tuple[int, int]] = field(default_factory=set)
     discovered_traps: set[tuple[int, int]] = field(default_factory=set)
 

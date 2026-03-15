@@ -9,20 +9,23 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 - `[x]` implemented
 - `[ ]` pending
 
-## 3. Current Baseline (Phase 6 Completed)
+## 3. Current Baseline (Phase 7 Completed)
 
 - [x] Multi-depth dungeon traversal and staircase transitions
 - [x] Overworld + town + dungeon world routing
 - [x] Character creation (race/class/seed)
 - [x] Modular systems architecture (`Turn`, `Combat`, `Inventory`, `AI`, `Persistence`)
 - [x] Equipment + melee + ranged combat
-- [x] Spellcasting baseline (Arcane Bolt + Mend) with mana
-- [x] Damage types + resistance mitigation logs
-- [x] XP leveling + talent milestones + talent selection
+- [x] Spellcasting suite (`Arcane Bolt`, `Venom Lance`, `Mend`, `Ward`) with mana schools
+- [x] Class-restricted branching talents with prerequisites
+- [x] Damage types + resistance mitigation
 - [x] Hidden trap discovery + disarm flow
-- [x] Town NPC services + quest scaffold
-- [x] Save migration up to `v4`
-- [x] Save backup fallback and corruption diagnostics
+- [x] Faction reputation influence on town NPC services
+- [x] Multi-step quest journal with timeout/failure outcomes
+- [x] Biome/archetype/vault dungeon generation baseline
+- [x] Corruption meter baseline with mutation trigger
+- [x] Save migration up to `v5`
+- [x] Save integrity checksum validation + backup fallback diagnostics
 
 ## 4. Backlog by Domain
 
@@ -34,7 +37,7 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 - [ ] Additional overworld travel nodes and route costs
 
 ### P1
-- [ ] Multiple themed dungeon lines
+- [ ] Multiple dungeon branches with differentiated progression goals
 - [ ] Region danger scaling and encounter ecology
 - [ ] World clock and travel-time consequences
 
@@ -43,10 +46,11 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 ### P0
 - [x] XP and level-up progression
 - [x] Talent-point milestone hooks
+- [x] Class specialization branches (initial implementation)
 - [ ] Attribute training/decay loops
 
 ### P1
-- [ ] Class skill trees and milestone specialization branches
+- [ ] Expanded skill training and class-specific passive ecosystems
 - [ ] Alignment axis and progression influence
 
 ## 4.3 Combat & Tactics
@@ -66,10 +70,10 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 ### P0
 - [x] Hunger + resting + regen loops
 - [x] Trap hazards and discovery mechanics
-- [ ] Disease/toxin variants and cure loops
+- [x] Corruption baseline and mutation trigger
+- [ ] Disease/toxin families and cure loops
 
 ### P1
-- [ ] Corruption pressure systems
 - [ ] Environmental hazard layers (temperature/terrain)
 - [ ] Long-run attrition balancing (ammo/food/piety economy)
 
@@ -77,11 +81,11 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 
 ### P0
 - [x] NPC role interactions (healer/shop/quest giver)
-- [x] Save-persistent single quest scaffold
-- [ ] Multi-quest journal and branching outcomes
+- [x] Reputation-aware town interactions
+- [x] Multi-step quest state + journal + timeout/failure
 
 ### P1
-- [ ] Faction reputation and response behaviors
+- [ ] Faction-specific questlines and standing-driven unlock sets
 - [ ] Named NPC progression and quest chains
 - [ ] Consequence propagation to world state and endings
 
@@ -89,19 +93,20 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 
 ### P0
 - [x] Depth-aware spawn and trap generation baseline
-- [ ] Biome/tile-set generation variants
-- [ ] Room archetype/vault/secret layout systems
+- [x] Biome generation variants
+- [x] Room archetype + vault layout hooks
 
 ### P1
-- [ ] Encounter table diversification by biome + depth + world state
-- [ ] Trap families with disarm skill checks and loot hooks
+- [ ] Encounter diversification by biome + depth + world state
+- [ ] Secret rooms and puzzle/lock feature hooks
+- [ ] Trap family diversification with richer disarm outcomes
 
 ## 4.7 Persistence and Reliability
 
 ### P0
-- [x] Versioned migration (`v2 -> v4`)
+- [x] Versioned migration (`v2 -> v5`)
 - [x] Backup fallback for corrupted primary saves
-- [ ] Save integrity checksum + explicit diagnostics UI
+- [x] Save integrity checksums + diagnostics panel integration
 
 ### P1
 - [ ] Run manifest metadata (score, duration, endings)
@@ -111,34 +116,34 @@ Track feature parity progress and define the next delivery wave toward ADOM-like
 
 Largest remaining parity gaps:
 
-1. **Deep progression complexity** (skills/specs/attributes beyond milestones)
-2. **Advanced combat ecology** (spells, AI roles, broader status gameplay)
-3. **World consequence simulation** (factions, branching quest outcomes, reactive world)
-4. **Procedural scale** (biomes, vaults, secrets, encounter diversity)
-5. **Long-run ADOM systems** (corruption/piety/morality pressure)
+1. **Advanced encounter ecology** (monster roles, caster AI, biome encounter tables)
+2. **Long-run progression pressure** (expanded corruption, diseases, alignment/economy)
+3. **World consequence depth** (multi-faction questlines, branching outcomes, region state)
+4. **Procedural variety scale** (secret structures, special room mechanics, encounter families)
 
-## 6. Next Phase (Phase 7) Plan
+## 6. Next Phase (Phase 8) Plan
 
 ## 6.1 Goal
 
-Move from baseline systems depth to **emergent progression + world consequence depth**.
+Move from structural/system parity to **encounter ecology and long-run world consequence depth**.
 
-## 6.2 Phase 7 TODO Cut
+## 6.2 Phase 8 TODO Cut
 
-1. [ ] Add multi-branch talent trees with class-specific specialization paths.
-2. [ ] Add mana schools + second offensive spell archetype + utility spell scaling.
-3. [ ] Add faction reputation layer and tie NPC services/quest availability to standing.
-4. [ ] Add multi-step quest journal with failure/timeout outcomes.
-5. [ ] Add biome-based dungeon variants with room archetype and vault generation.
-6. [ ] Add corruption meter baseline and one corruption mutation effect.
-7. [ ] Add save integrity checks and in-client corruption diagnostics panel.
+1. [ ] Introduce monster role families (brute/skirmisher/caster/support) with role-aware AI behaviors.
+2. [ ] Add advanced status set (slow/fear/confuse) with player + monster application paths.
+3. [ ] Expand faction layer to at least two additional factions and standing-driven quest unlock gates.
+4. [ ] Add biome-specific encounter tables and weighted spawn profiles.
+5. [ ] Add corruption stage progression beyond first mutation with at least one reversible mitigation path.
+6. [ ] Add secret room placement and reveal mechanics tied to exploration/perception systems.
+7. [ ] Extend save diagnostics with explicit category tags for integrity/migration/recovery events.
 
-## 6.3 Phase 7 Exit Criteria
+## 6.3 Phase 8 Exit Criteria
 
-- Build paths diverge materially through specialization choices.
-- NPC/quest availability changes based on player world interactions.
-- Dungeon runs feel biome-distinct and no longer layout-homogeneous.
-- At least one long-run pressure system (corruption) is active and test-covered.
+- Distinct monster behavior patterns are visible in combat encounters.
+- Faction standing meaningfully changes quest access and rewards.
+- Biome identity affects both map layout and encounter makeup.
+- Corruption develops beyond a single trigger and has tactical tradeoffs.
+- Save diagnostics remain readable and actionable under failure scenarios.
 
 ## 7. Validation Checklist (Per New Feature)
 

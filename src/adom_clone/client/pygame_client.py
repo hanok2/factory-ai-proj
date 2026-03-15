@@ -8,6 +8,8 @@ import pygame
 from adom_clone.core.game.actions import (
     CastArcaneBoltAction,
     CastMendAction,
+    CastVenomLanceAction,
+    CastWardAction,
     DisarmTrapAction,
     DropLastItemAction,
     GameAction,
@@ -38,7 +40,7 @@ CREATION_SIZE = (900, 620)
 def run_game() -> None:
     """Run the interactive client loop."""
     pygame.init()
-    pygame.display.set_caption("ADOM Clone - Phase 6")
+    pygame.display.set_caption("ADOM Clone - Phase 7")
 
     creation_screen = pygame.display.set_mode(CREATION_SIZE)
     selection = _character_creation_screen(creation_screen)
@@ -55,9 +57,11 @@ def run_game() -> None:
 
     running = True
     targeting_mode = False
-    spell_targeting_mode = False
+    spell_targeting_mode: str | None = None
     show_sheet = False
     show_talents = False
+    show_journal = False
+    show_diagnostics = False
     while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -69,7 +73,7 @@ def run_game() -> None:
                         session.add_message("Targeting cancelled.")
                         continue
                     if spell_targeting_mode:
-                        spell_targeting_mode = False
+                        spell_targeting_mode = None
                         session.add_message("Spell targeting cancelled.")
                         continue
                     if show_sheet:
@@ -77,6 +81,12 @@ def run_game() -> None:
                         continue
                     if show_talents:
                         show_talents = False
+                        continue
+                    if show_journal:
+                        show_journal = False
+                        continue
+                    if show_diagnostics:
+                        show_diagnostics = False
                         continue
                     running = False
 
@@ -86,6 +96,14 @@ def run_game() -> None:
 
                 if event.key == pygame.K_t:
                     show_talents = not show_talents
+                    continue
+
+                if event.key == pygame.K_j:
+                    show_journal = not show_journal
+                    continue
+
+                if event.key == pygame.K_o:
+                    show_diagnostics = not show_diagnostics
                     continue
 
                 if show_talents:
@@ -102,10 +120,10 @@ def run_game() -> None:
                     continue
 
                 if spell_targeting_mode:
-                    maybe_spell = _spell_direction_action_for_key(event.key)
+                    maybe_spell = _spell_direction_action_for_key(event.key, spell_targeting_mode)
                     if maybe_spell is not None:
                         session.queue_action(maybe_spell)
-                        spell_targeting_mode = False
+                        spell_targeting_mode = None
                     continue
 
                 if event.key == pygame.K_f:
@@ -114,12 +132,21 @@ def run_game() -> None:
                     continue
 
                 if event.key == pygame.K_z:
-                    spell_targeting_mode = True
-                    session.add_message("Spell targeting mode: choose a direction for Arcane Bolt.")
+                    spell_targeting_mode = "arcane_bolt"
+                    session.add_message("Spell targeting: choose a direction for Arcane Bolt.")
+                    continue
+
+                if event.key == pygame.K_b:
+                    spell_targeting_mode = "venom_lance"
+                    session.add_message("Spell targeting: choose a direction for Venom Lance.")
                     continue
 
                 if event.key == pygame.K_h:
                     session.queue_action(CastMendAction())
+                    continue
+
+                if event.key == pygame.K_u:
+                    session.queue_action(CastWardAction())
                     continue
 
                 if event.key == pygame.K_F5:
@@ -161,6 +188,8 @@ def run_game() -> None:
             session,
             show_sheet,
             show_talents,
+            show_journal,
+            show_diagnostics,
             targeting_mode,
             spell_targeting_mode,
         )
@@ -176,8 +205,10 @@ def _draw(
     session: GameSession,
     show_sheet: bool,
     show_talents: bool,
+    show_journal: bool,
+    show_diagnostics: bool,
     targeting_mode: bool,
-    spell_targeting_mode: bool,
+    spell_targeting_mode: str | None,
 ) -> None:
     """Draw map tiles, entities, and HUD."""
     screen.fill(BACKGROUND)
@@ -232,17 +263,20 @@ def _draw(
     )
     map_line = (
         f"Map: {map_name} | HP: {session.player_hp_text} "
-        f"| Mana: {session.player_mana_text} | Hunger: {session.player_hunger_text}"
+        f"| Mana: {session.player_mana_text} | Hunger: {session.player_hunger_text} "
+        f"| Corruption: {session.player_corruption_text}"
     )
     stats_line = (
         f"Power: {session.player_power} | Defense: {session.player_defense} "
-        f"| {session.player_level_text} | Turns: {session.turn_count} | Kills: {session.kill_count}"
+        f"| {session.player_level_text} | Turns: {session.turn_count} "
+        f"| Kills: {session.kill_count} "
+        f"| {session.faction_text}"
     )
     controls_line = (
         "Move: WASD/Arrows | G:pickup | 1-9:use/equip/eat | "
-        "F:throw | Z:bolt | H:mend | E:interact | V:rest | X:disarm"
+        "F:throw | Z:bolt | B:venom | H:mend | U:ward | E:interact | V:rest | X:disarm"
     )
-    save_line = "R:drop | C:sheet | T:talents | F5: save | F9: load | ESC: quit"
+    save_line = "R:drop | C:sheet | T:talents | J:journal | O:diagnostics | F5/F9 save/load"
     inventory_line = _inventory_line(session)
     quest_line = session.quest_text
     lines = [
@@ -257,7 +291,10 @@ def _draw(
     if targeting_mode:
         lines.append("Targeting mode active: press a movement direction to throw.")
     if spell_targeting_mode:
-        lines.append("Spell targeting active: press a movement direction for Arcane Bolt.")
+        if spell_targeting_mode == "venom_lance":
+            lines.append("Spell targeting active: press a movement direction for Venom Lance.")
+        else:
+            lines.append("Spell targeting active: press a movement direction for Arcane Bolt.")
     if session.game_over:
         lines.append("Game over. Press ESC to quit.")
     _blit_lines(screen, font, lines, hud_y + 8)
@@ -266,6 +303,10 @@ def _draw(
         _draw_character_sheet(screen, font, session)
     if show_talents:
         _draw_talent_panel(screen, font, session)
+    if show_journal:
+        _draw_journal_panel(screen, font, session)
+    if show_diagnostics:
+        _draw_diagnostics_panel(screen, font, session)
 
 
 def _inventory_line(session: GameSession) -> str:
@@ -329,16 +370,24 @@ def _ranged_action_for_key(key: int) -> RangedAttackAction | None:
     return None
 
 
-def _spell_direction_action_for_key(key: int) -> CastArcaneBoltAction | None:
+def _spell_direction_action_for_key(
+    key: int,
+    spell_targeting_mode: str,
+) -> CastArcaneBoltAction | CastVenomLanceAction | None:
     if key in (pygame.K_w, pygame.K_UP):
-        return CastArcaneBoltAction(0, -1)
-    if key in (pygame.K_s, pygame.K_DOWN):
-        return CastArcaneBoltAction(0, 1)
-    if key in (pygame.K_a, pygame.K_LEFT):
-        return CastArcaneBoltAction(-1, 0)
-    if key in (pygame.K_d, pygame.K_RIGHT):
-        return CastArcaneBoltAction(1, 0)
-    return None
+        dx, dy = (0, -1)
+    elif key in (pygame.K_s, pygame.K_DOWN):
+        dx, dy = (0, 1)
+    elif key in (pygame.K_a, pygame.K_LEFT):
+        dx, dy = (-1, 0)
+    elif key in (pygame.K_d, pygame.K_RIGHT):
+        dx, dy = (1, 0)
+    else:
+        return None
+
+    if spell_targeting_mode == "venom_lance":
+        return CastVenomLanceAction(dx, dy)
+    return CastArcaneBoltAction(dx, dy)
 
 
 def _talent_action_for_key(key: int, session: GameSession) -> SelectTalentAction | None:
@@ -378,6 +427,7 @@ def _draw_character_sheet(
         f"Seed: {session.seed}",
         f"{session.player_level_text}",
         f"Mana: {session.player_mana_text}",
+        f"Corruption: {session.player_corruption_text}",
         f"HP: {session.player_hp_text}",
         f"Hunger: {session.player_hunger_text}",
         f"Power: {session.player_power}",
@@ -385,6 +435,7 @@ def _draw_character_sheet(
         f"{session.spellbook_text}",
         f"{session.player_talents_text}",
         f"{session.quest_text}",
+        f"{session.faction_text}",
         f"Weapon: {weapon_name}",
         f"Armor: {armor_name}",
         f"Turns: {session.turn_count} | Kills: {session.kill_count}",
@@ -413,6 +464,46 @@ def _draw_talent_panel(
     if not options:
         lines.append("No talents available.")
 
+    _blit_lines(screen, font, lines, panel.y + 12)
+
+
+def _draw_journal_panel(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    session: GameSession,
+) -> None:
+    panel = pygame.Rect(100, 100, screen.get_width() - 200, screen.get_height() - 200)
+    pygame.draw.rect(screen, (12, 12, 18), panel)
+    pygame.draw.rect(screen, (210, 180, 120), panel, width=2)
+
+    lines = [
+        "Quest Journal (J to close)",
+        f"{session.quest_text}",
+        "",
+        *session.quest_journal_lines(),
+    ]
+    _blit_lines(screen, font, lines, panel.y + 12)
+
+
+def _draw_diagnostics_panel(
+    screen: pygame.Surface,
+    font: pygame.font.Font,
+    session: GameSession,
+) -> None:
+    panel = pygame.Rect(120, 120, screen.get_width() - 240, screen.get_height() - 240)
+    pygame.draw.rect(screen, (10, 14, 20), panel)
+    pygame.draw.rect(screen, (130, 200, 235), panel, width=2)
+
+    lines = [
+        "Save Diagnostics (O to close)",
+        "Recent integrity and recovery events:",
+        "",
+    ]
+    diagnostics = session.save_diagnostics[-10:]
+    if diagnostics:
+        lines.extend(diagnostics)
+    else:
+        lines.append("No diagnostics recorded yet.")
     _blit_lines(screen, font, lines, panel.y + 12)
 
 

@@ -40,7 +40,12 @@
       "mana_base": 6,
       "mana_per_level": 1,
       "talent_milestones": [3, 6, 9],
-      "starting_spells": ["mend"]
+      "starting_spells": ["mend", "ward"],
+      "school_mastery": {
+        "vitality": 3,
+        "arcane": 0,
+        "poison": 0
+      }
     },
     {
       "id": "thief",
@@ -56,7 +61,12 @@
       "mana_base": 8,
       "mana_per_level": 1,
       "talent_milestones": [3, 5, 8],
-      "starting_spells": ["arcane_bolt"]
+      "starting_spells": ["arcane_bolt", "venom_lance", "ward"],
+      "school_mastery": {
+        "vitality": 1,
+        "arcane": 1,
+        "poison": 3
+      }
     },
     {
       "id": "wizard",
@@ -72,7 +82,12 @@
       "mana_base": 12,
       "mana_per_level": 2,
       "talent_milestones": [2, 4, 6, 8],
-      "starting_spells": ["arcane_bolt", "mend"]
+      "starting_spells": ["arcane_bolt", "venom_lance", "mend", "ward"],
+      "school_mastery": {
+        "vitality": 2,
+        "arcane": 4,
+        "poison": 1
+      }
     }
   ]
 }

@@ -96,6 +96,8 @@ class StatusEffects:
     poison: int = 0
     bleed: int = 0
     stun: int = 0
+    ward_turns: int = 0
+    ward_strength: int = 0
 
 
 @dataclass(slots=True)
@@ -113,6 +115,12 @@ class DamageType(str, Enum):
     PHYSICAL = "physical"
     POISON = "poison"
     ARCANE = "arcane"
+
+
+class ManaSchool(str, Enum):
+    ARCANE = "arcane"
+    POISON = "poison"
+    VITALITY = "vitality"
 
 
 @dataclass(slots=True)
@@ -144,3 +152,9 @@ class NpcRole(str, Enum):
 class Npc:
     name: str
     role: NpcRole
+
+
+@dataclass(slots=True)
+class Corruption:
+    value: int = 0
+    mutation: str | None = None

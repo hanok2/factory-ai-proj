@@ -1,5 +1,6 @@
 """Gameplay system modules used by GameSession."""
 
+import hashlib
 import json
 import shutil
 from collections import deque
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, cast
 from adom_clone.core.ecs.components import (
     BlocksMovement,
     Consumable,
+    Corruption,
     DamageType,
     Equipment,
     EquipmentSlot,
@@ -36,6 +38,8 @@ from adom_clone.core.ecs.store import ECSStore
 from adom_clone.core.game.actions import (
     CastArcaneBoltAction,
     CastMendAction,
+    CastVenomLanceAction,
+    CastWardAction,
     DisarmTrapAction,
     DropLastItemAction,
     GameAction,
@@ -71,6 +75,8 @@ class TurnSystem:
 
         session.turn_count += 1
         session.tick_hunger()
+        session.tick_corruption()
+        session.tick_quest_timers()
         session.apply_status_damage(session.player_entity)
         session.apply_natural_regen()
         if not session.game_over:
@@ -97,6 +103,10 @@ class TurnSystem:
             return session.cast_arcane_bolt(action.dx, action.dy)
         if isinstance(action, CastMendAction):
             return session.cast_mend()
+        if isinstance(action, CastVenomLanceAction):
+            return session.cast_venom_lance(action.dx, action.dy)
+        if isinstance(action, CastWardAction):
+            return session.cast_ward()
         if isinstance(action, SelectTalentAction):
             return session.select_talent(action.talent_id)
         if isinstance(action, WaitAction):
@@ -460,6 +470,15 @@ class PersistenceSystem:
                     "poison": status.poison,
                     "bleed": status.bleed,
                     "stun": status.stun,
+                    "ward_turns": status.ward_turns,
+                    "ward_strength": status.ward_strength,
+                }
+
+            corruption = session.ecs.get_component(entity_id, Corruption)
+            if corruption is not None:
+                entity_data["corruption"] = {
+                    "value": corruption.value,
+                    "mutation": corruption.mutation,
                 }
 
             mana = session.ecs.get_component(entity_id, Mana)
@@ -546,7 +565,7 @@ class PersistenceSystem:
             entities.append(entity_data)
 
         return {
-            "version": 4,
+            "version": 5,
             "seed": session.seed,
             "race_id": session.race_id,
             "class_id": session.class_id,
@@ -558,6 +577,7 @@ class PersistenceSystem:
             "turn_count": session.turn_count,
             "kill_count": session.kill_count,
             "regen_counter": session.regen_counter,
+            "faction_reputation": session.faction_reputation,
             "quest_state": _serialize_quest_state(session),
             "trap_state": _serialize_trap_state(session),
             "entities": entities,
@@ -572,8 +592,12 @@ class PersistenceSystem:
             backup_path = path.with_suffix(path.suffix + ".bak")
             shutil.copy2(path, backup_path)
 
-        payload = json.dumps(self.to_save_data(session), separators=(",", ":"))
+        save_data = self.to_save_data(session)
+        save_data["integrity"] = _compute_integrity(save_data)
+        payload = json.dumps(save_data, separators=(",", ":"))
         path.write_text(payload, encoding="utf-8")
+        integrity_prefix = _expect_str(save_data["integrity"], "integrity")[:10]
+        session.add_diagnostic(f"Saved {path.name} with integrity {integrity_prefix}...")
 
     def load_from_file(self, file_path: str) -> "GameSession":
         path = Path(file_path)
@@ -589,6 +613,8 @@ class PersistenceSystem:
             try:
                 raw_backup = json.loads(backup_path.read_text(encoding="utf-8"))
                 loaded = self.from_save_data(raw_backup)
+                loaded.add_diagnostic(f"Primary save invalid: {exc}")
+                loaded.add_diagnostic(f"Recovered from backup: {backup_path.name}")
                 loaded.add_message(
                     f"Primary save was invalid and backup was restored from {backup_path.name}.",
                 )
@@ -607,6 +633,7 @@ class PersistenceSystem:
 
         raw_dict = _expect_dict(raw_data, "save_data")
         data = _migrate_save_data(raw_dict)
+        _validate_integrity(data)
 
         seed = _expect_int(data.get("seed", 1337), "seed")
         race_id = _expect_str(data.get("race_id", "human"), "race_id")
@@ -625,11 +652,19 @@ class PersistenceSystem:
         session.messages = _expect_str_list(data.get("messages", []), "messages")
         if not session.messages:
             session.messages = ["Loaded save."]
+        if "integrity" in data:
+            session.add_diagnostic("Integrity check passed for loaded save payload.")
+        else:
+            session.add_diagnostic("Loaded migrated save without source integrity metadata.")
 
         session.game_over = _expect_bool(data.get("game_over", False), "game_over")
         session.turn_count = _expect_int(data.get("turn_count", 0), "turn_count")
         session.kill_count = _expect_int(data.get("kill_count", 0), "kill_count")
         session.regen_counter = _expect_int(data.get("regen_counter", 0), "regen_counter")
+        session.faction_reputation = _expect_str_int_dict(
+            data.get("faction_reputation", {"townfolk": 0}),
+            "faction_reputation",
+        )
         quest_state = data.get("quest_state")
         if quest_state is not None:
             _load_quest_state(session, quest_state)
@@ -734,6 +769,31 @@ class PersistenceSystem:
                         poison=_expect_int(status_data.get("poison", 0), "entity.status.poison"),
                         bleed=_expect_int(status_data.get("bleed", 0), "entity.status.bleed"),
                         stun=_expect_int(status_data.get("stun", 0), "entity.status.stun"),
+                        ward_turns=_expect_int(
+                            status_data.get("ward_turns", 0),
+                            "entity.status.ward_turns",
+                        ),
+                        ward_strength=_expect_int(
+                            status_data.get("ward_strength", 0),
+                            "entity.status.ward_strength",
+                        ),
+                    ),
+                )
+
+            raw_corruption = entity_data.get("corruption")
+            if raw_corruption is not None:
+                corruption_data = _expect_dict(raw_corruption, "entity.corruption")
+                mutation_raw = corruption_data.get("mutation")
+                session.ecs.add_component(
+                    entity_id,
+                    Corruption(
+                        value=_expect_int(
+                            corruption_data.get("value", 0),
+                            "entity.corruption.value",
+                        ),
+                        mutation=None
+                        if mutation_raw is None
+                        else _expect_str(mutation_raw, "entity.corruption.mutation"),
                     ),
                 )
 
@@ -949,7 +1009,7 @@ class PersistenceSystem:
         _ensure_status_components(session)
         _ensure_progression_component(session)
         _ensure_monster_xp_rewards(session)
-        _ensure_phase6_components(session)
+        _ensure_phase7_components(session)
 
         _ = session.player_position
         _ = session.player_fighter
@@ -1031,10 +1091,15 @@ def _serialize_quest_state(session: "GameSession") -> dict[str, object]:
     quest = session.quest_state
     return {
         "quest_id": quest.quest_id,
+        "stage": quest.stage,
         "accepted": quest.accepted,
         "target_kills": quest.target_kills,
+        "kills_progress": quest.kills_progress,
+        "deadline_turn": quest.deadline_turn,
         "completed": quest.completed,
+        "failed": quest.failed,
         "turned_in": quest.turned_in,
+        "journal": [*quest.journal],
     }
 
 
@@ -1044,6 +1109,7 @@ def _load_quest_state(session: "GameSession", raw: object) -> None:
         data.get("quest_id", "town_goblin_cull"),
         "quest_state.quest_id",
     )
+    session.quest_state.stage = _expect_int(data.get("stage", 0), "quest_state.stage")
     session.quest_state.accepted = _expect_bool(
         data.get("accepted", False),
         "quest_state.accepted",
@@ -1052,19 +1118,36 @@ def _load_quest_state(session: "GameSession", raw: object) -> None:
         data.get("target_kills", 3),
         "quest_state.target_kills",
     )
+    session.quest_state.kills_progress = _expect_int(
+        data.get("kills_progress", 0),
+        "quest_state.kills_progress",
+    )
+    session.quest_state.deadline_turn = _expect_int(
+        data.get("deadline_turn", 0),
+        "quest_state.deadline_turn",
+    )
     session.quest_state.completed = _expect_bool(
         data.get("completed", False),
         "quest_state.completed",
+    )
+    session.quest_state.failed = _expect_bool(
+        data.get("failed", False),
+        "quest_state.failed",
     )
     session.quest_state.turned_in = _expect_bool(
         data.get("turned_in", False),
         "quest_state.turned_in",
     )
+    journal_raw = _expect_list(data.get("journal", []), "quest_state.journal")
+    session.quest_state.journal = [
+        _expect_str(item, "quest_state.journal_item")
+        for item in journal_raw
+    ]
 
 
 def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
     version = _expect_int(data.get("version", 2), "version")
-    if version == 4:
+    if version == 5:
         return data
     if version == 2:
         migrated = dict(data)
@@ -1083,6 +1166,34 @@ def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
             "completed": False,
             "turned_in": False,
         })
+        version = 4
+        data = migrated
+
+    if version == 4:
+        migrated = dict(data)
+        migrated["version"] = 5
+        migrated.setdefault("faction_reputation", {"townfolk": 0})
+        quest_state = _expect_dict(migrated.get("quest_state", {}), "quest_state")
+        quest_state.setdefault("kills_progress", 0)
+        stage = _expect_int(quest_state.get("stage", 0), "quest_state.stage")
+        accepted = _expect_bool(quest_state.get("accepted", False), "quest_state.accepted")
+        completed = _expect_bool(quest_state.get("completed", False), "quest_state.completed")
+        turned_in = _expect_bool(quest_state.get("turned_in", False), "quest_state.turned_in")
+        failed = _expect_bool(quest_state.get("failed", False), "quest_state.failed")
+        if stage == 0:
+            if failed:
+                stage = 4
+            elif turned_in:
+                stage = 3
+            elif completed:
+                stage = 2
+            elif accepted:
+                stage = 1
+        quest_state["stage"] = stage
+        quest_state.setdefault("deadline_turn", 0)
+        quest_state.setdefault("failed", False)
+        quest_state.setdefault("journal", [])
+        migrated["quest_state"] = quest_state
         return migrated
 
     msg = f"Unsupported save version: {version}"
@@ -1117,8 +1228,8 @@ def _ensure_monster_xp_rewards(session: "GameSession") -> None:
             session.ecs.add_component(entity_id, ExperienceReward(xp=10))
 
 
-def _ensure_phase6_components(session: "GameSession") -> None:
-    """Backfill Phase 6 components when loading older saves."""
+def _ensure_phase7_components(session: "GameSession") -> None:
+    """Backfill Phase 6/7 components when loading older saves."""
     if session.ecs.get_component(session.player_entity, Mana) is None:
         session.ecs.add_component(
             session.player_entity,
@@ -1131,6 +1242,8 @@ def _ensure_phase6_components(session: "GameSession") -> None:
         session.ecs.add_component(session.player_entity, Talents())
     if session.ecs.get_component(session.player_entity, Resistances) is None:
         session.ecs.add_component(session.player_entity, Resistances())
+    if session.ecs.get_component(session.player_entity, Corruption) is None:
+        session.ecs.add_component(session.player_entity, Corruption())
 
     for entity_id, _monster in session.ecs.entities_with(Monster):
         if session.ecs.get_component(entity_id, Resistances) is None:
@@ -1138,6 +1251,9 @@ def _ensure_phase6_components(session: "GameSession") -> None:
 
     if not session.ecs.entities_with(Npc):
         session._spawn_town_npcs()
+
+    if "townfolk" not in session.faction_reputation:
+        session.faction_reputation["townfolk"] = 0
 
 
 def _coords_set(raw_list: list[object], field_name: str) -> set[tuple[int, int]]:
@@ -1150,6 +1266,36 @@ def _coords_set(raw_list: list[object], field_name: str) -> set[tuple[int, int]]
         x = _expect_int(pair[0], f"{field_name}[{idx}][0]")
         y = _expect_int(pair[1], f"{field_name}[{idx}][1]")
         result.add((x, y))
+    return result
+
+
+def _compute_integrity(data: dict[str, object]) -> str:
+    sanitized = {key: value for key, value in data.items() if key != "integrity"}
+    payload = json.dumps(sanitized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_integrity(data: dict[str, object]) -> None:
+    integrity_value = data.get("integrity")
+    if integrity_value is None:
+        # Older saves migrated to v5 do not have source integrity metadata.
+        return
+    if not isinstance(integrity_value, str):
+        msg = "save_data.integrity must be a string"
+        raise ValueError(msg)
+
+    expected = _compute_integrity(data)
+    if integrity_value != expected:
+        msg = "Save integrity check failed."
+        raise ValueError(msg)
+
+
+def _expect_str_int_dict(value: object, field_name: str) -> dict[str, int]:
+    raw = _expect_dict(value, field_name)
+    result: dict[str, int] = {}
+    for key, item in raw.items():
+        name = _expect_str(key, f"{field_name}.key")
+        result[name] = _expect_int(item, f"{field_name}[{name}]")
     return result
 
 

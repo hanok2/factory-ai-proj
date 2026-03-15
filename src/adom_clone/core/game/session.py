@@ -2,11 +2,12 @@
 
 import random
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from adom_clone.core.ecs.components import (
     BlocksMovement,
     Consumable,
+    Corruption,
     DamageType,
     Equipment,
     EquipmentSlot,
@@ -18,6 +19,7 @@ from adom_clone.core.ecs.components import (
     Inventory,
     Item,
     Mana,
+    ManaSchool,
     Monster,
     Npc,
     NpcRole,
@@ -65,22 +67,71 @@ class CharacterSelection:
 
 @dataclass(slots=True)
 class QuestState:
-    """Tracks a single early-game quest used for world-state persistence scaffolding."""
+    """Tracks a multi-step quest with timeout/failure for Phase 7 world simulation."""
 
     quest_id: str = "town_goblin_cull"
+    stage: int = 0
     accepted: bool = False
     target_kills: int = 3
+    kills_progress: int = 0
+    deadline_turn: int = 0
     completed: bool = False
+    failed: bool = False
     turned_in: bool = False
+    journal: list[str] = field(default_factory=list)
 
 
-TALENT_DESCRIPTIONS: dict[str, str] = {
-    # Improves spell throughput by reducing mana costs.
-    "arcane_efficiency": "Reduce all spell mana costs by 1.",
-    # Improves trap discovery odds to support hidden-trap gameplay.
-    "keen_senses": "Greatly improves hidden-trap detection.",
-    # Adds flat physical mitigation to support survivability builds.
-    "hardened": "Gain +10% physical resistance.",
+@dataclass(frozen=True)
+class TalentDefinition:
+    """Describes one node in the class-specific specialization talent trees."""
+
+    id: str
+    branch: str
+    classes: tuple[str, ...]
+    description: str
+    prerequisites: tuple[str, ...] = ()
+
+
+TALENT_DEFINITIONS: dict[str, TalentDefinition] = {
+    "arcane_efficiency": TalentDefinition(
+        id="arcane_efficiency",
+        branch="Evoker",
+        classes=("wizard", "thief"),
+        description="Reduce spell costs by 1 mana.",
+    ),
+    "chain_bolt": TalentDefinition(
+        id="chain_bolt",
+        branch="Evoker",
+        classes=("wizard",),
+        description="Arcane Bolt can strike a second nearby target.",
+        prerequisites=("arcane_efficiency",),
+    ),
+    "keen_senses": TalentDefinition(
+        id="keen_senses",
+        branch="Scout",
+        classes=("thief", "fighter"),
+        description="Improved hidden-trap detection.",
+    ),
+    "poison_mastery": TalentDefinition(
+        id="poison_mastery",
+        branch="Assassin",
+        classes=("thief", "wizard"),
+        description="Venom Lance damage and poison duration increase.",
+        prerequisites=("keen_senses",),
+    ),
+    "hardened": TalentDefinition(
+        id="hardened",
+        branch="Guardian",
+        classes=("fighter",),
+        description="Gain +10% physical resistance.",
+    ),
+    "steel_bulwark": TalentDefinition(
+        id="steel_bulwark",
+        branch="Guardian",
+        classes=("fighter",),
+        description="Gain +1 defense and +10% poison resistance.",
+        prerequisites=("hardened",),
+    ),
 }
 
 
@@ -118,6 +169,8 @@ class GameSession:
         self.kill_count = 0
         self.regen_counter = 0
         self.quest_state = QuestState()
+        self.faction_reputation: dict[str, int] = {"townfolk": 0}
+        self.save_diagnostics: list[str] = []
         self._action_queue: deque[GameAction] = deque()
 
         self.turn_system = TurnSystem()
@@ -232,6 +285,14 @@ class GameSession:
         return resistances
 
     @property
+    def player_corruption(self) -> Corruption:
+        corruption = self.ecs.get_component(self.player_entity, Corruption)
+        if corruption is None:
+            msg = "Player entity is missing Corruption component."
+            raise RuntimeError(msg)
+        return corruption
+
+    @property
     def player_hp_text(self) -> str:
         fighter = self.player_fighter
         return f"{fighter.hp}/{fighter.max_hp}"
@@ -245,6 +306,12 @@ class GameSession:
     def player_mana_text(self) -> str:
         mana = self.player_mana
         return f"{mana.current}/{mana.max_value}"
+
+    @property
+    def player_corruption_text(self) -> str:
+        corruption = self.player_corruption
+        mutation = "none" if corruption.mutation is None else corruption.mutation
+        return f"{corruption.value}/100 ({mutation})"
 
     @property
     def player_power(self) -> int:
@@ -271,11 +338,13 @@ class GameSession:
         quest = self.quest_state
         if not quest.accepted:
             return "Quest: not accepted"
+        if quest.failed:
+            return "Quest: failed"
         if quest.turned_in:
             return "Quest: completed"
         if quest.completed:
             return "Quest: return to Captain Durn"
-        remaining = max(0, quest.target_kills - self.kill_count)
+        remaining = max(0, quest.target_kills - quest.kills_progress)
         return f"Quest: {remaining} kills remaining"
 
     @property
@@ -285,10 +354,26 @@ class GameSession:
             return "Spells: none"
         return "Spells: " + ", ".join(spells)
 
+    @property
+    def faction_text(self) -> str:
+        town_rep = self.faction_reputation.get("townfolk", 0)
+        return f"Townfolk rep: {town_rep}"
+
+    def quest_journal_lines(self) -> list[str]:
+        if not self.quest_state.journal:
+            return ["Quest journal is empty."]
+        return [*self.quest_state.journal[-6:]]
+
     def add_message(self, text: str) -> None:
         self.messages.append(text)
         if len(self.messages) > 250:
             del self.messages[:-250]
+
+    def add_diagnostic(self, text: str) -> None:
+        """Track save/load integrity diagnostics for UI inspection panels."""
+        self.save_diagnostics.append(text)
+        if len(self.save_diagnostics) > 100:
+            del self.save_diagnostics[:-100]
 
     def queue_action(self, action: GameAction) -> None:
         self._action_queue.append(action)
@@ -297,7 +382,12 @@ class GameSession:
         self.turn_system.advance_turn(self)
 
     def cast_arcane_bolt(self, dx: int, dy: int) -> bool:
-        """Cast a directional projectile spell that deals ARCANE damage."""
+        """Cast a directional projectile spell that deals ARCANE damage.
+
+        Phase 7 note:
+        - arcane school mastery contributes to damage scaling,
+        - `chain_bolt` specialization can hit one secondary nearby target.
+        """
         if dx == 0 and dy == 0:
             self.add_message("Choose a direction for Arcane Bolt.")
             return False
@@ -305,7 +395,7 @@ class GameSession:
             self.add_message("You have not learned Arcane Bolt.")
             return False
 
-        mana_cost = self._spell_cost(4)
+        mana_cost = self._spell_cost(4, ManaSchool.ARCANE)
         if not self._spend_mana(mana_cost):
             return False
 
@@ -332,7 +422,11 @@ class GameSession:
             if self.ecs.get_component(blocker, Fighter) is None:
                 break
 
-            base_damage = 5 + self.player_progression.level // 2
+            base_damage = (
+                5
+                + self.player_progression.level // 2
+                + self._school_mastery(ManaSchool.ARCANE)
+            )
             actual, mitigated = self.apply_damage(
                 blocker,
                 base_damage,
@@ -346,9 +440,94 @@ class GameSession:
                 actual,
                 mitigated,
             )
+
+            # Talent branch extension: arcane chain can bounce to one adjacent hostile target.
+            if "chain_bolt" in self.player_talents.selected:
+                self._chain_bolt_followup(primary_target=blocker, bonus=max(1, base_damage // 2))
             return True
 
         self.add_message("Arcane Bolt dissipates without hitting a target.")
+        return True
+
+    def cast_venom_lance(self, dx: int, dy: int) -> bool:
+        """Cast a poison-school offensive spell that applies damage-over-time."""
+        if dx == 0 and dy == 0:
+            self.add_message("Choose a direction for Venom Lance.")
+            return False
+        if not self.has_spell("venom_lance"):
+            self.add_message("You have not learned Venom Lance.")
+            return False
+
+        mana_cost = self._spell_cost(5, ManaSchool.POISON)
+        if not self._spend_mana(mana_cost):
+            return False
+
+        start = self.player_position
+        for step in range(1, 6):
+            tx = start.x + dx * step
+            ty = start.y + dy * step
+            if not self.current_map.in_bounds(tx, ty):
+                break
+            if not self.current_map.is_passable(tx, ty):
+                break
+
+            blocker = self.blocking_entity_at(
+                tx,
+                ty,
+                self.current_map.kind,
+                self.current_depth,
+                self.player_entity,
+            )
+            if blocker is None:
+                continue
+            if self.ecs.get_component(blocker, Fighter) is None:
+                break
+
+            poison_mastery = self._school_mastery(ManaSchool.POISON)
+            if "poison_mastery" in self.player_talents.selected:
+                poison_mastery += 2
+
+            base_damage = 4 + poison_mastery
+            actual, mitigated = self.apply_damage(
+                blocker,
+                base_damage,
+                DamageType.POISON,
+                source="Venom Lance",
+            )
+            self.apply_status(
+                blocker,
+                poison=2 + max(0, poison_mastery // 2),
+            )
+            self._log_player_damage(
+                blocker,
+                "Venom Lance",
+                DamageType.POISON,
+                actual,
+                mitigated,
+            )
+            return True
+
+        self.add_message("Venom Lance misses and dissipates into the air.")
+        return True
+
+    def cast_ward(self) -> bool:
+        """Cast a utility defensive spell whose potency scales with vitality mastery."""
+        if not self.has_spell("ward"):
+            self.add_message("You have not learned Ward.")
+            return False
+
+        mana_cost = self._spell_cost(4, ManaSchool.VITALITY)
+        if not self._spend_mana(mana_cost):
+            return False
+
+        status = self.player_status
+        mastery = self._school_mastery(ManaSchool.VITALITY)
+        status.ward_turns = max(status.ward_turns, 4 + mastery // 2)
+        status.ward_strength = max(status.ward_strength, 8 + mastery * 2)
+        self.add_message(
+            "A protective ward surrounds you "
+            f"({status.ward_strength}% for {status.ward_turns} turns).",
+        )
         return True
 
     def cast_mend(self) -> bool:
@@ -357,13 +536,17 @@ class GameSession:
             self.add_message("You have not learned Mend.")
             return False
 
-        mana_cost = self._spell_cost(3)
+        mana_cost = self._spell_cost(3, ManaSchool.VITALITY)
         if not self._spend_mana(mana_cost):
             return False
 
         fighter = self.player_fighter
         before = fighter.hp
-        heal_amount = 4 + self.player_progression.level // 3
+        heal_amount = (
+            4
+            + self.player_progression.level // 3
+            + self._school_mastery(ManaSchool.VITALITY) // 2
+        )
         fighter.hp = min(fighter.max_hp, fighter.hp + heal_amount)
         healed = fighter.hp - before
         if healed <= 0:
@@ -373,9 +556,13 @@ class GameSession:
         return True
 
     def select_talent(self, talent_id: str) -> bool:
-        """Spend talent points on a permanent passive talent choice."""
+        """Spend talent points on a permanent passive talent choice.
+
+        Phase 7 talent trees enforce class restrictions and prerequisites.
+        """
         talents = self.player_talents
-        if talent_id not in TALENT_DESCRIPTIONS:
+        definition = TALENT_DEFINITIONS.get(talent_id)
+        if definition is None:
             self.add_message("Unknown talent selection.")
             return False
         if talent_id in talents.selected:
@@ -383,6 +570,17 @@ class GameSession:
             return False
         if talents.points <= 0:
             self.add_message("No talent points available.")
+            return False
+
+        if self.class_id not in definition.classes:
+            self.add_message("Your class cannot learn that talent.")
+            return False
+
+        missing_prereq = [
+            prereq for prereq in definition.prerequisites if prereq not in talents.selected
+        ]
+        if missing_prereq:
+            self.add_message(f"Talent requires: {', '.join(missing_prereq)}.")
             return False
 
         talents.selected.append(talent_id)
@@ -393,6 +591,12 @@ class GameSession:
             self.player_resistances.physical_pct = min(
                 80,
                 self.player_resistances.physical_pct + 10,
+            )
+        if talent_id == "steel_bulwark":
+            self.player_fighter.defense += 1
+            self.player_resistances.poison_pct = min(
+                80,
+                self.player_resistances.poison_pct + 10,
             )
 
         self.add_message(f"Talent learned: {talent_id}.")
@@ -426,9 +630,14 @@ class GameSession:
     def available_talent_options(self) -> list[tuple[str, str]]:
         talents = self.player_talents
         options: list[tuple[str, str]] = []
-        for talent_id, description in TALENT_DESCRIPTIONS.items():
+        for talent_id, definition in TALENT_DEFINITIONS.items():
             if talent_id in talents.selected:
                 continue
+            if self.class_id not in definition.classes:
+                continue
+            if any(prereq not in talents.selected for prereq in definition.prerequisites):
+                continue
+            description = f"[{definition.branch}] {definition.description}"
             options.append((talent_id, description))
         return options
 
@@ -463,16 +672,29 @@ class GameSession:
         if resist is None:
             return 0
 
-        if damage_type == DamageType.PHYSICAL:
-            return max(0, min(80, resist.physical_pct))
-        if damage_type == DamageType.POISON:
-            return max(0, min(80, resist.poison_pct))
-        return max(0, min(80, resist.arcane_pct))
+        ward_bonus = 0
+        if entity_id == self.player_entity:
+            status = self.player_status
+            if status.ward_turns > 0:
+                ward_bonus = status.ward_strength
 
-    def _spell_cost(self, base_cost: int) -> int:
+        if damage_type == DamageType.PHYSICAL:
+            return max(0, min(80, resist.physical_pct + ward_bonus))
+        if damage_type == DamageType.POISON:
+            return max(0, min(80, resist.poison_pct + ward_bonus))
+        return max(0, min(80, resist.arcane_pct + ward_bonus))
+
+    def _spell_cost(self, base_cost: int, school: ManaSchool) -> int:
+        """Compute spell costs with school mastery and talent reductions."""
+        reduction = self._school_mastery(school) // 5
         if "arcane_efficiency" in self.player_talents.selected:
-            return max(1, base_cost - 1)
-        return base_cost
+            reduction += 1
+        return max(1, base_cost - reduction)
+
+    def _school_mastery(self, school: ManaSchool) -> int:
+        class_bonus = self.character_class.school_mastery.get(school.value, 0)
+        level_bonus = self.player_progression.level // 3
+        return class_bonus + level_bonus
 
     def _spend_mana(self, amount: int) -> bool:
         mana = self.player_mana
@@ -496,6 +718,44 @@ class GameSession:
             f"{source} hits {target_name} for {actual} {damage_type.value} damage"
             f" ({mitigated} resisted).",
         )
+
+    def _chain_bolt_followup(self, primary_target: int, bonus: int) -> None:
+        """Apply a secondary strike to one adjacent enemy near the primary target."""
+        primary_pos = self.ecs.get_component(primary_target, Position)
+        if primary_pos is None:
+            return
+
+        for other_id, _monster in self.ecs.entities_with(Monster):
+            if other_id == primary_target:
+                continue
+            on_map = self.ecs.get_component(other_id, OnMap)
+            if on_map is None:
+                continue
+            if on_map.kind != self.current_map.kind:
+                continue
+            if on_map.kind == MapKind.DUNGEON and on_map.depth != self.current_depth:
+                continue
+
+            other_pos = self.ecs.get_component(other_id, Position)
+            if other_pos is None:
+                continue
+            if abs(other_pos.x - primary_pos.x) + abs(other_pos.y - primary_pos.y) > 2:
+                continue
+
+            actual, mitigated = self.apply_damage(
+                other_id,
+                max(1, bonus),
+                DamageType.ARCANE,
+                source="Chain Bolt",
+            )
+            self._log_player_damage(
+                other_id,
+                "Chain Bolt",
+                DamageType.ARCANE,
+                actual,
+                mitigated,
+            )
+            return
 
     def _regenerate_mana(self) -> None:
         mana = self.player_mana
@@ -545,6 +805,13 @@ class GameSession:
         status = self.ecs.get_component(entity_id, StatusEffects)
         if fighter is None or status is None or fighter.hp <= 0:
             return
+
+        if status.ward_turns > 0:
+            status.ward_turns -= 1
+            if status.ward_turns == 0:
+                status.ward_strength = 0
+                if entity_id == self.player_entity:
+                    self.add_message("Your protective ward fades.")
 
         if status.poison > 0:
             status.poison -= 1
@@ -635,6 +902,8 @@ class GameSession:
         poison: int = 0,
         bleed: int = 0,
         stun: int = 0,
+        ward_turns: int = 0,
+        ward_strength: int = 0,
     ) -> None:
         status = self.ecs.get_component(entity_id, StatusEffects)
         if status is None:
@@ -647,6 +916,10 @@ class GameSession:
             status.bleed = max(status.bleed, bleed)
         if stun > 0:
             status.stun = max(status.stun, stun)
+        if ward_turns > 0:
+            status.ward_turns = max(status.ward_turns, ward_turns)
+        if ward_strength > 0:
+            status.ward_strength = max(status.ward_strength, ward_strength)
 
     def grant_player_xp(self, xp: int) -> None:
         if xp <= 0:
@@ -696,6 +969,39 @@ class GameSession:
                 source="starvation",
             )
             self.add_message(f"You are starving! ({actual} damage, {mitigated} resisted)")
+
+    def tick_corruption(self) -> None:
+        """Advance corruption in dungeon zones and trigger baseline mutations."""
+        if self.current_map.kind != MapKind.DUNGEON:
+            return
+
+        corruption = self.player_corruption
+        depth = self.current_depth or 1
+        corruption.value += 1 + depth // 2
+
+        if corruption.mutation is None and corruption.value >= 100:
+            corruption.mutation = "chaos_skin"
+            # Mutation baseline effect: higher arcane resistance, lower base defense.
+            self.player_resistances.arcane_pct = min(80, self.player_resistances.arcane_pct + 15)
+            self.player_fighter.defense = max(0, self.player_fighter.defense - 1)
+            self.add_message("Corruption mutates your skin with unstable arcane patterns.")
+
+    def tick_quest_timers(self) -> None:
+        """Fail active quests when their deadline expires."""
+        quest = self.quest_state
+        if not quest.accepted or quest.failed or quest.turned_in:
+            return
+        if quest.deadline_turn <= 0:
+            return
+        if self.turn_count <= quest.deadline_turn:
+            return
+
+        quest.failed = True
+        quest.stage = 4
+        quest.completed = False
+        self.faction_reputation["townfolk"] = self.faction_reputation.get("townfolk", 0) - 5
+        quest.journal.append("Quest failed: you returned too late.")
+        self.add_message("Quest failed: you missed the deadline.")
 
     def apply_move(self, dx: int, dy: int) -> bool:
         position = self.player_position
@@ -796,10 +1102,20 @@ class GameSession:
         if reward is not None:
             self.grant_player_xp(reward.xp)
 
-        if self.quest_state.accepted and not self.quest_state.completed:
-            if self.kill_count >= self.quest_state.target_kills:
+        if (
+            self.quest_state.accepted
+            and not self.quest_state.failed
+            and not self.quest_state.completed
+        ):
+            self.quest_state.kills_progress += 1
+            remaining = max(0, self.quest_state.target_kills - self.quest_state.kills_progress)
+            if remaining == 0:
                 self.quest_state.completed = True
+                self.quest_state.stage = 2
+                self.quest_state.journal.append("Objective complete. Return to Captain Durn.")
                 self.add_message("Quest update: Return to Captain Durn for your reward.")
+            else:
+                self.quest_state.journal.append(f"Quest progress: {remaining} kills remaining.")
 
     def serializable_entity_ids(self) -> list[int]:
         entity_ids = {self.player_entity}
@@ -825,6 +1141,7 @@ class GameSession:
             Mana,
             Talents,
             Npc,
+            Corruption,
         )
         for component_type in component_types:
             for entity_id, _ in self.ecs.entities_with(component_type):
@@ -948,6 +1265,7 @@ class GameSession:
         )
         self.ecs.add_component(self.player_entity, Talents())
         self.ecs.add_component(self.player_entity, Resistances())
+        self.ecs.add_component(self.player_entity, Corruption())
 
     def _spawn_world_content(self) -> None:
         self._spawn_item_rules(self.spawn_content.overworld_items, MapKind.OVERWORLD, depth=None)
@@ -955,6 +1273,16 @@ class GameSession:
         for depth in range(1, self.dungeon_level_count + 1):
             self._spawn_item_rules(self.spawn_content.dungeon_items, MapKind.DUNGEON, depth=depth)
             self._spawn_monster_rules(self.spawn_content.dungeon_monsters, depth=depth)
+
+            # Phase 7 vault hook: each generated vault receives one guaranteed reward.
+            level_map = self.map_for_depth(depth)
+            if level_map.vault_pos is None:
+                continue
+            template = self.spawn_content.item_templates.get("healing_potion")
+            if template is None:
+                continue
+            vx, vy = level_map.vault_pos
+            self._spawn_item_on_map(template, MapKind.DUNGEON, depth, vx, vy)
 
     def _spawn_town_npcs(self) -> None:
         """Populate the town hub with baseline service NPCs used in Phase 6."""
@@ -1012,7 +1340,9 @@ class GameSession:
                 if map_kind == MapKind.OVERWORLD and tile_map.entrance_pos == (x, y):
                     continue
                 if map_kind == MapKind.DUNGEON and (
-                    tile_map.exit_pos == (x, y) or tile_map.stairs_down_pos == (x, y)
+                    tile_map.exit_pos == (x, y)
+                    or tile_map.stairs_down_pos == (x, y)
+                    or tile_map.vault_pos == (x, y)
                 ):
                     continue
 
@@ -1251,26 +1581,53 @@ class GameSession:
 
     def _interact_quest_giver(self, npc: Npc) -> bool:
         quest = self.quest_state
+        town_rep = self.faction_reputation.get("townfolk", 0)
+
+        if town_rep < -10:
+            self.add_message(
+                f"{npc.name}: I won't trust you with contracts "
+                "until your reputation improves.",
+            )
+            return True
+
+        if quest.failed:
+            self.add_message(f"{npc.name}: You failed the last assignment. Earn my trust first.")
+            return True
+
         if not quest.accepted:
             quest.accepted = True
+            quest.stage = 1
+            quest.kills_progress = 0
+            quest.completed = False
+            quest.turned_in = False
+            quest.deadline_turn = self.turn_count + 180
+            quest.journal.append(
+                f"Accepted quest from {npc.name}: eliminate {quest.target_kills} monsters "
+                f"before turn {quest.deadline_turn}.",
+            )
             self.add_message(
                 f"{npc.name}: Clear {quest.target_kills} monsters in the dungeon and return.",
             )
             return True
 
         if quest.accepted and not quest.completed:
-            if self.kill_count >= quest.target_kills:
+            if quest.kills_progress >= quest.target_kills:
                 quest.completed = True
+                quest.stage = 2
+                quest.journal.append("Return to town and report completion.")
                 self.add_message(f"{npc.name}: Well done. Turn in to claim your reward.")
                 return True
-            remaining = max(0, quest.target_kills - self.kill_count)
+            remaining = max(0, quest.target_kills - quest.kills_progress)
             self.add_message(f"{npc.name}: Keep going. {remaining} more kills needed.")
             return True
 
         if quest.completed and not quest.turned_in:
             quest.turned_in = True
+            quest.stage = 3
             self.grant_player_xp(25)
             self._grant_reward_item("healing_potion")
+            self.faction_reputation["townfolk"] = town_rep + 8
+            quest.journal.append("Quest turned in. Captain Durn rewarded you.")
             self.add_message(f"{npc.name}: Excellent work. Take this reward.")
             return True
 
@@ -1278,6 +1635,11 @@ class GameSession:
         return True
 
     def _interact_healer(self, npc: Npc) -> bool:
+        town_rep = self.faction_reputation.get("townfolk", 0)
+        if town_rep < -15:
+            self.add_message(f"{npc.name}: I cannot aid someone the town distrusts.")
+            return True
+
         fighter = self.player_fighter
         if fighter.hp >= fighter.max_hp and self.player_mana.current >= self.player_mana.max_value:
             self.add_message(f"{npc.name}: You are already in peak condition.")
@@ -1288,16 +1650,26 @@ class GameSession:
         self.player_status.poison = 0
         self.player_status.bleed = 0
         self.player_status.stun = 0
+        self.player_status.ward_turns = 0
+        self.player_status.ward_strength = 0
         self.add_message(f"{npc.name} restores your health, mana, and cleanses ailments.")
         return True
 
     def _interact_shopkeeper(self, npc: Npc) -> bool:
+        town_rep = self.faction_reputation.get("townfolk", 0)
+        if town_rep < -20:
+            self.add_message(f"{npc.name}: I don't sell to troublemakers.")
+            return True
+
         inventory = self.player_inventory
         if len(inventory.item_ids) >= inventory.capacity:
             self.add_message(f"{npc.name}: Your pack is full.")
             return False
 
-        reward_template = "ration" if self.turn_count % 2 == 0 else "throwing_knife"
+        if town_rep >= 15:
+            reward_template = "healing_potion"
+        else:
+            reward_template = "ration" if self.turn_count % 2 == 0 else "throwing_knife"
         self._grant_reward_item(reward_template)
         self.add_message(f"{npc.name} hands you a {reward_template.replace('_', ' ')}.")
         return True
