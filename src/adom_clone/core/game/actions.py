@@ -64,5 +64,16 @@ class CastMendAction(GameAction):
 
 
 @dataclass(slots=True)
+class CastVenomLanceAction(GameAction):
+    dx: int
+    dy: int
+
+
+@dataclass(slots=True)
+class CastWardAction(GameAction):
+    pass
+
+
+@dataclass(slots=True)
 class SelectTalentAction(GameAction):
     talent_id: str

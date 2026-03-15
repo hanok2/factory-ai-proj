@@ -1,24 +1,26 @@
-# ADOM-Clone Current Design (Phase 6 Implementation)
+# ADOM-Clone Current Design (Phase 7 Implementation)
 
 ## 1. Scope of the Current Build
 
-The project now includes the full **Phase 6 sprint cut** on top of the Phase 5 baseline.
+The project now includes the full **Phase 7 sprint cut** on top of the Phase 6 baseline.
 
 Implemented highlights:
 
 - modular ECS-driven runtime (`Turn`, `Combat`, `Inventory`, `AI`, `Persistence`),
 - overworld + town hub + multi-depth dungeon world structure,
-- character creation and class/race/seed-driven starts,
-- melee + ranged + spellcasting (Arcane Bolt + Mend),
-- typed damage and resistance mitigation logging,
-- XP leveling plus talent point milestones and talent selection,
-- town NPC services (healer/shopkeeper/quest giver),
-- hidden trap discovery + disarm flow,
-- save migration to schema v4 with backup fallback and corruption diagnostics.
+- biome-aware dungeon generation (crypt / fungal caves / molten ruins),
+- room archetypes (`chamber`, `crossroads`, `split_halls`) and vault placement hooks,
+- melee + ranged + expanded spellcasting (`Arcane Bolt`, `Venom Lance`, `Mend`, `Ward`),
+- mana-school scaling (`arcane`, `poison`, `vitality`) with class mastery profiles,
+- class-restricted branching talent trees with prerequisites,
+- faction reputation affecting NPC service behavior,
+- multi-step quest state with journal entries and timeout/failure outcomes,
+- corruption meter with mutation trigger (`chaos_skin`),
+- save schema v5 with checksum validation + backup recovery diagnostics panel support.
 
 ## 2. Runtime Architecture
 
-## 2.1 Layering
+### 2.1 Layering
 
 - **Core domain (`src/adom_clone/core`)**
   - ECS components and store,
@@ -29,23 +31,24 @@ Implemented highlights:
 - **Client (`src/adom_clone/client`)**
   - pygame input loop, render layers, HUD/modals.
 
-## 2.2 Core Components Added in Phase 6
+### 2.2 Core Components Added Through Phase 7
 
-- `Mana`
-- `Talents`
-- `Resistances`
+- `Mana`, `Talents`, `Resistances`
+- `Corruption`
 - `Npc` + `NpcRole`
-- `DamageType` enum
-- `QuestState` (session-level run state)
+- `DamageType`, `ManaSchool`
+- expanded `StatusEffects` (ward duration/strength)
+- `QuestState` with stage/progress/deadline/failure/journal fields
 
 ## 3. World Model
 
-- **Overworld**
-  - contains dungeon entrance and town entry tile.
-- **Town**
-  - contains service NPCs and quest-giver interactions.
-- **Dungeon Levels**
-  - maintain depth-indexed stairs and trap state.
+- **Overworld**: dungeon entrance + town entry tile.
+- **Town**: healer/shopkeeper/quest-giver NPC hub.
+- **Dungeon Levels**:
+  - depth-indexed stairs and trap state,
+  - biome metadata,
+  - room archetype metadata,
+  - optional vault anchor position.
 
 Transition graph:
 
@@ -53,95 +56,98 @@ Transition graph:
 - overworld <-> dungeon level 1
 - dungeon depth N <-> N+1 via stairs
 
-## 4. Progression + Talent Layer
+## 4. Progression and Talent Trees
 
 - XP is granted via `ExperienceReward` on monster death.
-- Level-up grants stat growth (HP/power/defense/mana scaling by class).
-- Talent points are granted at class-defined milestone levels.
-- Talent selection is explicit and persistent.
-
-Current talents:
-
-- `arcane_efficiency` (reduced spell costs)
-- `keen_senses` (better hidden trap detection)
-- `hardened` (+physical resistance)
+- Level-up grants class-driven HP/power/defense/mana growth.
+- Talent points unlock at class milestones.
+- Talent selection now enforces:
+  - class restrictions,
+  - prerequisite chains,
+  - branch-specific progression paths.
 
 ## 5. Combat and Magic
 
-## 5.1 Damage Typing
+### 5.1 Damage and Resistances
 
-Damage now carries type (`physical`, `poison`, `arcane`) and is resolved through resistance mitigation.
+Damage types remain `physical`, `poison`, and `arcane` with per-entity mitigation.
+`Ward` contributes temporary resistance while active.
 
-Combat log messaging exposes dealt and resisted damage for player-facing clarity.
+### 5.2 Spell Suite
 
-## 5.2 Spellcasting Baseline
+- **Arcane Bolt**: directional arcane projectile, can chain via talent.
+- **Venom Lance**: directional poison spell with DOT application.
+- **Mend**: vitality-scaled self-heal.
+- **Ward**: vitality-scaled defensive utility buff.
 
-- **Arcane Bolt**: directional projectile spell (mana cost + arcane damage).
-- **Mend**: utility self-heal spell.
+Spell costs and potency are influenced by class school mastery and talents.
 
-Mana regenerates over time; spell costs can be modified by talents.
+## 6. Town, Reputation, and Questing
 
-## 6. Town NPC + Quest Scaffold
+- Reputation (`townfolk`) gates and modifies NPC behavior.
+- Quest flow is now staged:
+  1. accept objective,
+  2. complete kill requirement,
+  3. return for turn-in,
+  4. fail on deadline expiration.
+- Quest journal entries are persisted and exposed in UI.
 
-Town includes three role-based NPC interactions:
+## 7. Corruption System
 
-- **Quest giver**: starts and resolves a kill-target quest chain,
-- **Healer**: restores HP/mana and clears statuses,
-- **Shopkeeper**: provides baseline supplies.
+- Corruption increases while adventuring in dungeon floors.
+- At threshold, mutation activates (`chaos_skin`) and applies baseline gameplay impact.
+- Corruption and mutation status are visible in HUD/character sheet.
 
-Quest state is serialized and restored across save/load.
+## 8. Persistence and Reliability
 
-## 7. Hidden Trap System
-
-- Traps are tracked separately as hidden vs discovered.
-- Trap perception runs each turn with deterministic detection checks.
-- Adjacent traps are reliably discoverable.
-- Only discovered traps are rendered in HUD map layer.
-
-## 8. Persistence and Recovery
-
-Current save schema is **version 4**.
+Current save schema is **version 5**.
 
 Persistence includes:
 
-- quest state,
-- town state,
+- quest stage/progress/failure/journal,
+- faction reputation,
+- corruption component state,
+- expanded status fields,
 - trap hidden/discovered state,
-- phase 6 components (mana/talents/resistances/NPCs).
+- checksum (`sha256`) integrity metadata.
 
 Reliability behavior:
 
-- saves create `.bak` backups when overwriting,
-- corrupted primary saves attempt backup recovery,
-- diagnostics are surfaced when recovery is not possible.
+- `.bak` backup rotation when overwriting saves,
+- checksum validation on load,
+- automatic fallback to backup if primary is corrupted/tampered,
+- diagnostic entries surfaced for client diagnostics panel.
 
 ## 9. Client/UI State
 
 UI now includes:
 
 - ranged targeting mode,
-- spell targeting mode,
+- dual spell targeting modes (`Arcane Bolt`, `Venom Lance`),
+- utility spell casting shortcuts (`Mend`, `Ward`),
 - talent selection modal,
-- expanded character sheet (mana/talents/spells/quest),
-- interact command for NPC services.
+- quest journal panel,
+- save diagnostics panel,
+- expanded character sheet (corruption/reputation/quest data).
 
 ## 10. Test Coverage Snapshot
 
 Automated coverage now validates:
 
-- progression + talent selection,
-- arcane spellcasting + mana usage,
-- town interaction and quest activation,
-- hidden trap discovery,
-- corrupted-save fallback to backup,
-- all previous combat/inventory/transition/save foundations.
+- class talent restrictions and prerequisite gating,
+- venom lance + ward behavior,
+- quest timeout/failure and reputation impact,
+- corruption mutation trigger,
+- biome/archetype/vault dungeon metadata,
+- checksum mismatch recovery via backup,
+- all prior combat/inventory/transition/persistence foundations.
 
-## 11. Remaining Gaps After Phase 6
+## 11. Remaining Gaps After Phase 7
 
 Major ADOM-parity gaps still open:
 
-- deep class progression trees and skill training,
-- richer spell/status ecosystems and advanced AI roles,
-- multi-quest/faction/world-reaction simulation,
-- broader procgen diversity (biomes, vaults, secrets),
-- long-run systems (corruption/piety/alignment, economy depth).
+- broader monster role ecology and tactical AI,
+- deeper status ecosystem (blind/confuse/fear/slow variants),
+- larger overworld travel/consequence simulation,
+- expanded corruption/morality/economy long-run loops,
+- richer dungeon feature diversity (secrets, encounter families, special rooms).

@@ -139,4 +139,4 @@ def test_load_v2_save_migrates_to_v3() -> None:
 
     loaded = GameSession.from_save_data(save_data)
     assert loaded.player_progression.level >= 1
-    assert loaded.to_save_data()["version"] == 4
+    assert loaded.to_save_data()["version"] == 5
