@@ -23,6 +23,7 @@ from adom_clone.core.ecs.components import (
     Item,
     Mana,
     Monster,
+    MonsterRole,
     Npc,
     NpcRole,
     OnMap,
@@ -66,10 +67,10 @@ class TurnSystem:
             return
 
         action = session._action_queue.popleft()
-        if session.consume_player_stun_turn():
+        if session.consume_player_stun_turn() or session.player_fear_prevents_action(action):
             acted = True
         else:
-            acted = self._apply_action(session, action)
+            acted = self._apply_action(session, session.resolve_player_action(action))
         if not acted:
             return
 
@@ -365,17 +366,18 @@ class InventorySystem:
 
 
 class AISystem:
-    """Simple deterministic chase-and-attack monster AI."""
+    """Role-aware deterministic monster AI."""
 
     def run_monster_turns(self, session: "GameSession") -> None:
         player_position = session.player_position
-        for entity_id, _monster in session.ecs.entities_with(Monster):
+        for entity_id, monster in session.ecs.entities_with(Monster):
             if session.game_over:
                 return
 
             position = session.ecs.get_component(entity_id, Position)
             on_map = session.ecs.get_component(entity_id, OnMap)
             fighter = session.ecs.get_component(entity_id, Fighter)
+            status = session.ecs.get_component(entity_id, StatusEffects)
             if position is None or on_map is None or fighter is None or fighter.hp <= 0:
                 continue
             if on_map.kind != session.current_map.kind or on_map.depth != session.current_depth:
@@ -385,31 +387,222 @@ class AISystem:
                 session.apply_status_damage(entity_id)
                 continue
 
-            dist_x = player_position.x - position.x
-            dist_y = player_position.y - position.y
-            if abs(dist_x) + abs(dist_y) == 1:
-                session.combat_system.attack(session, entity_id, session.player_entity)
+            if status is not None and status.slow > 0 and (session.turn_count + entity_id) % 2 == 0:
                 session.apply_status_damage(entity_id)
                 continue
 
-            for dx, dy in self._chase_directions(dist_x, dist_y):
-                nx = position.x + dx
-                ny = position.y + dy
-                if not session.current_map.is_passable(nx, ny):
+            dist_x = player_position.x - position.x
+            dist_y = player_position.y - position.y
+            if status is not None and status.confuse > 0:
+                if self._move_confused(session, entity_id, position):
+                    session.apply_status_damage(entity_id)
                     continue
-                blocker = session.blocking_entity_at(
-                    nx,
-                    ny,
-                    session.current_map.kind,
-                    session.current_depth,
-                    entity_id,
-                )
-                if blocker is None:
-                    position.x = nx
-                    position.y = ny
-                    break
+
+            acted = False
+            if monster.role == MonsterRole.CASTER:
+                acted = self._caster_turn(session, entity_id, position, dist_x, dist_y)
+            elif monster.role == MonsterRole.SUPPORT:
+                acted = self._support_turn(session, entity_id, position, dist_x, dist_y)
+            elif monster.role == MonsterRole.SKIRMISHER:
+                acted = self._skirmisher_turn(session, entity_id, position, dist_x, dist_y)
+            else:
+                acted = self._brute_turn(session, entity_id, position, dist_x, dist_y)
+
+            if not acted and abs(dist_x) + abs(dist_y) == 1:
+                session.combat_system.attack(session, entity_id, session.player_entity)
+                if monster.role == MonsterRole.BRUTE and (session.turn_count + entity_id) % 3 == 0:
+                    session.apply_status(session.player_entity, fear=1)
+                session.apply_status_damage(entity_id)
+                continue
+
+            if not acted:
+                self._move_toward(session, entity_id, position, dist_x, dist_y)
 
             session.apply_status_damage(entity_id)
+
+    def _brute_turn(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        if abs(dist_x) + abs(dist_y) <= 1:
+            return False
+        self._move_toward(session, entity_id, position, dist_x, dist_y)
+        return True
+
+    def _skirmisher_turn(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        distance = abs(dist_x) + abs(dist_y)
+        if distance == 1:
+            fighter = session.ecs.get_component(entity_id, Fighter)
+            if fighter is not None and fighter.hp < fighter.max_hp // 2:
+                self._move_away(session, entity_id, position, dist_x, dist_y)
+                return True
+            return False
+        if distance <= 3 and (session.turn_count + entity_id) % 2 == 0:
+            actual, mitigated = session.apply_damage(
+                session.player_entity,
+                2,
+                DamageType.PHYSICAL,
+                source="skirmisher jab",
+            )
+            session.apply_status(session.player_entity, bleed=1)
+            session.add_message(
+                f"Skirmisher strikes for {actual} physical damage ({mitigated} resisted).",
+            )
+            return True
+
+        self._move_toward(session, entity_id, position, dist_x, dist_y)
+        return True
+
+    def _caster_turn(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        if self._in_spell_lane(position, session.player_position, max_range=4):
+            actual, mitigated = session.apply_damage(
+                session.player_entity,
+                3,
+                DamageType.ARCANE,
+                source="monster spell",
+            )
+            if (session.turn_count + entity_id) % 2 == 0:
+                session.apply_status(session.player_entity, confuse=2)
+            else:
+                session.apply_status(session.player_entity, fear=1)
+            session.add_message(
+                f"A hostile caster blasts you for {actual} arcane damage ({mitigated} resisted).",
+            )
+            return True
+
+        self._move_toward(session, entity_id, position, dist_x, dist_y)
+        return True
+
+    def _support_turn(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        ally = self._adjacent_wounded_ally(session, entity_id, position)
+        if ally is not None:
+            ally_fighter = session.ecs.get_component(ally, Fighter)
+            if ally_fighter is not None:
+                ally_fighter.hp = min(ally_fighter.max_hp, ally_fighter.hp + 2)
+                session.add_message("A support monster bolsters its ally.")
+                return True
+
+        if abs(dist_x) + abs(dist_y) <= 3:
+            session.apply_status(session.player_entity, slow=2)
+            session.add_message("A support monster hex slows you.")
+            return True
+
+        self._move_toward(session, entity_id, position, dist_x, dist_y)
+        return True
+
+    def _move_confused(self, session: "GameSession", entity_id: int, position: Position) -> bool:
+        directions = ((1, 0), (-1, 0), (0, 1), (0, -1))
+        idx = (session.turn_count + entity_id) % len(directions)
+        dx, dy = directions[idx]
+        return self._move_if_open(session, entity_id, position, dx, dy)
+
+    def _move_toward(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        for dx, dy in self._chase_directions(dist_x, dist_y):
+            if self._move_if_open(session, entity_id, position, dx, dy):
+                return True
+        return False
+
+    def _move_away(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dist_x: int,
+        dist_y: int,
+    ) -> bool:
+        for dx, dy in self._chase_directions(-dist_x, -dist_y):
+            if self._move_if_open(session, entity_id, position, dx, dy):
+                return True
+        return False
+
+    def _move_if_open(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+        dx: int,
+        dy: int,
+    ) -> bool:
+        nx = position.x + dx
+        ny = position.y + dy
+        if not session.current_map.is_passable(nx, ny):
+            return False
+        blocker = session.blocking_entity_at(
+            nx,
+            ny,
+            session.current_map.kind,
+            session.current_depth,
+            entity_id,
+        )
+        if blocker is not None:
+            return False
+        position.x = nx
+        position.y = ny
+        return True
+
+    def _in_spell_lane(self, source: Position, target: Position, max_range: int) -> bool:
+        if source.x == target.x:
+            return abs(source.y - target.y) <= max_range
+        if source.y == target.y:
+            return abs(source.x - target.x) <= max_range
+        return False
+
+    def _adjacent_wounded_ally(
+        self,
+        session: "GameSession",
+        entity_id: int,
+        position: Position,
+    ) -> int | None:
+        for other_id, _monster in session.ecs.entities_with(Monster):
+            if other_id == entity_id:
+                continue
+            other_position = session.ecs.get_component(other_id, Position)
+            other_fighter = session.ecs.get_component(other_id, Fighter)
+            other_map = session.ecs.get_component(other_id, OnMap)
+            if other_position is None or other_fighter is None or other_map is None:
+                continue
+            if (
+                other_map.kind != session.current_map.kind
+                or other_map.depth != session.current_depth
+            ):
+                continue
+            if other_fighter.hp >= other_fighter.max_hp:
+                continue
+            if abs(other_position.x - position.x) + abs(other_position.y - position.y) == 1:
+                return other_id
+        return None
 
     def _chase_directions(self, dist_x: int, dist_y: int) -> list[tuple[int, int]]:
         step_x = 0 if dist_x == 0 else (1 if dist_x > 0 else -1)
@@ -434,6 +627,8 @@ class PersistenceSystem:
             monster = session.ecs.get_component(entity_id, Monster)
             if monster is not None:
                 entity_data["monster_name"] = monster.name
+                entity_data["monster_role"] = monster.role.value
+                entity_data["monster_faction"] = monster.faction
 
             position = session.ecs.get_component(entity_id, Position)
             if position is not None:
@@ -470,6 +665,9 @@ class PersistenceSystem:
                     "poison": status.poison,
                     "bleed": status.bleed,
                     "stun": status.stun,
+                    "slow": status.slow,
+                    "fear": status.fear,
+                    "confuse": status.confuse,
                     "ward_turns": status.ward_turns,
                     "ward_strength": status.ward_strength,
                 }
@@ -565,7 +763,7 @@ class PersistenceSystem:
             entities.append(entity_data)
 
         return {
-            "version": 5,
+            "version": 6,
             "seed": session.seed,
             "race_id": session.race_id,
             "class_id": session.class_id,
@@ -597,7 +795,10 @@ class PersistenceSystem:
         payload = json.dumps(save_data, separators=(",", ":"))
         path.write_text(payload, encoding="utf-8")
         integrity_prefix = _expect_str(save_data["integrity"], "integrity")[:10]
-        session.add_diagnostic(f"Saved {path.name} with integrity {integrity_prefix}...")
+        session.add_diagnostic(
+            "integrity",
+            f"Saved {path.name} with integrity {integrity_prefix}...",
+        )
 
     def load_from_file(self, file_path: str) -> "GameSession":
         path = Path(file_path)
@@ -613,8 +814,8 @@ class PersistenceSystem:
             try:
                 raw_backup = json.loads(backup_path.read_text(encoding="utf-8"))
                 loaded = self.from_save_data(raw_backup)
-                loaded.add_diagnostic(f"Primary save invalid: {exc}")
-                loaded.add_diagnostic(f"Recovered from backup: {backup_path.name}")
+                loaded.add_diagnostic("recovery", f"Primary save invalid: {exc}")
+                loaded.add_diagnostic("recovery", f"Recovered from backup: {backup_path.name}")
                 loaded.add_message(
                     f"Primary save was invalid and backup was restored from {backup_path.name}.",
                 )
@@ -653,16 +854,22 @@ class PersistenceSystem:
         if not session.messages:
             session.messages = ["Loaded save."]
         if "integrity" in data:
-            session.add_diagnostic("Integrity check passed for loaded save payload.")
+            session.add_diagnostic("integrity", "Integrity check passed for loaded save payload.")
         else:
-            session.add_diagnostic("Loaded migrated save without source integrity metadata.")
+            session.add_diagnostic(
+                "migration",
+                "Loaded migrated save without source integrity metadata.",
+            )
 
         session.game_over = _expect_bool(data.get("game_over", False), "game_over")
         session.turn_count = _expect_int(data.get("turn_count", 0), "turn_count")
         session.kill_count = _expect_int(data.get("kill_count", 0), "kill_count")
         session.regen_counter = _expect_int(data.get("regen_counter", 0), "regen_counter")
         session.faction_reputation = _expect_str_int_dict(
-            data.get("faction_reputation", {"townfolk": 0}),
+            data.get(
+                "faction_reputation",
+                {"townfolk": 0, "arcane_order": 0, "wild_clans": 0},
+            ),
             "faction_reputation",
         )
         quest_state = data.get("quest_state")
@@ -694,9 +901,23 @@ class PersistenceSystem:
 
             monster_name = entity_data.get("monster_name")
             if monster_name is not None:
+                role_raw = entity_data.get("monster_role")
+                faction_raw = entity_data.get("monster_faction")
                 session.ecs.add_component(
                     entity_id,
-                    Monster(name=_expect_str(monster_name, "entity.monster_name")),
+                    Monster(
+                        name=_expect_str(monster_name, "entity.monster_name"),
+                        role=MonsterRole(
+                            _expect_str(
+                                "brute" if role_raw is None else role_raw,
+                                "entity.monster_role",
+                            ),
+                        ),
+                        faction=_expect_str(
+                            "dungeon_denizens" if faction_raw is None else faction_raw,
+                            "entity.monster_faction",
+                        ),
+                    ),
                 )
 
             raw_position = entity_data.get("position")
@@ -769,6 +990,12 @@ class PersistenceSystem:
                         poison=_expect_int(status_data.get("poison", 0), "entity.status.poison"),
                         bleed=_expect_int(status_data.get("bleed", 0), "entity.status.bleed"),
                         stun=_expect_int(status_data.get("stun", 0), "entity.status.stun"),
+                        slow=_expect_int(status_data.get("slow", 0), "entity.status.slow"),
+                        fear=_expect_int(status_data.get("fear", 0), "entity.status.fear"),
+                        confuse=_expect_int(
+                            status_data.get("confuse", 0),
+                            "entity.status.confuse",
+                        ),
                         ward_turns=_expect_int(
                             status_data.get("ward_turns", 0),
                             "entity.status.ward_turns",
@@ -1009,7 +1236,7 @@ class PersistenceSystem:
         _ensure_status_components(session)
         _ensure_progression_component(session)
         _ensure_monster_xp_rewards(session)
-        _ensure_phase7_components(session)
+        _ensure_phase8_components(session)
 
         _ = session.player_position
         _ = session.player_fighter
@@ -1026,19 +1253,34 @@ class PersistenceSystem:
 def _serialize_trap_state(session: "GameSession") -> dict[str, object]:
     dungeon: dict[str, list[list[int]]] = {}
     dungeon_discovered: dict[str, list[list[int]]] = {}
+    dungeon_secrets: dict[str, list[list[int]]] = {}
+    dungeon_discovered_secrets: dict[str, list[list[int]]] = {}
     for tile_map in session.dungeon_levels:
         coords = sorted(tile_map.trap_positions)
         dungeon[str(tile_map.depth)] = [[x, y] for x, y in coords]
         discovered = sorted(tile_map.discovered_traps)
         dungeon_discovered[str(tile_map.depth)] = [[x, y] for x, y in discovered]
+        secrets = sorted(tile_map.secret_rooms)
+        dungeon_secrets[str(tile_map.depth)] = [[x, y] for x, y in secrets]
+        discovered_secrets = sorted(tile_map.discovered_secrets)
+        dungeon_discovered_secrets[str(tile_map.depth)] = [[x, y] for x, y in discovered_secrets]
 
     return {
         "overworld": [[x, y] for x, y in sorted(session.overworld.trap_positions)],
         "overworld_discovered": [[x, y] for x, y in sorted(session.overworld.discovered_traps)],
         "town": [[x, y] for x, y in sorted(session.town.trap_positions)],
         "town_discovered": [[x, y] for x, y in sorted(session.town.discovered_traps)],
+        "overworld_secrets": [[x, y] for x, y in sorted(session.overworld.secret_rooms)],
+        "overworld_discovered_secrets": [
+            [x, y]
+            for x, y in sorted(session.overworld.discovered_secrets)
+        ],
+        "town_secrets": [[x, y] for x, y in sorted(session.town.secret_rooms)],
+        "town_discovered_secrets": [[x, y] for x, y in sorted(session.town.discovered_secrets)],
         "dungeon": dungeon,
         "dungeon_discovered": dungeon_discovered,
+        "dungeon_secrets": dungeon_secrets,
+        "dungeon_discovered_secrets": dungeon_discovered_secrets,
     }
 
 
@@ -1063,10 +1305,46 @@ def _load_trap_state(session: "GameSession", raw: object) -> None:
     )
     session.town.discovered_traps = _coords_set(town_discovered_raw, "trap_state.town_discovered")
 
+    overworld_secrets_raw = _expect_list(
+        data.get("overworld_secrets", []),
+        "trap_state.overworld_secrets",
+    )
+    session.overworld.secret_rooms = _coords_set(
+        overworld_secrets_raw,
+        "trap_state.overworld_secrets",
+    )
+    overworld_discovered_secrets_raw = _expect_list(
+        data.get("overworld_discovered_secrets", []),
+        "trap_state.overworld_discovered_secrets",
+    )
+    session.overworld.discovered_secrets = _coords_set(
+        overworld_discovered_secrets_raw,
+        "trap_state.overworld_discovered_secrets",
+    )
+
+    town_secrets_raw = _expect_list(data.get("town_secrets", []), "trap_state.town_secrets")
+    session.town.secret_rooms = _coords_set(town_secrets_raw, "trap_state.town_secrets")
+    town_discovered_secrets_raw = _expect_list(
+        data.get("town_discovered_secrets", []),
+        "trap_state.town_discovered_secrets",
+    )
+    session.town.discovered_secrets = _coords_set(
+        town_discovered_secrets_raw,
+        "trap_state.town_discovered_secrets",
+    )
+
     dungeon_raw = _expect_dict(data.get("dungeon", {}), "trap_state.dungeon")
     dungeon_discovered_raw = _expect_dict(
         data.get("dungeon_discovered", {}),
         "trap_state.dungeon_discovered",
+    )
+    dungeon_secrets_raw = _expect_dict(
+        data.get("dungeon_secrets", {}),
+        "trap_state.dungeon_secrets",
+    )
+    dungeon_discovered_secrets_raw = _expect_dict(
+        data.get("dungeon_discovered_secrets", {}),
+        "trap_state.dungeon_discovered_secrets",
     )
     for depth_text, coords_raw in dungeon_raw.items():
         depth = _expect_int(depth_text_to_int(depth_text), "trap_state.dungeon.depth")
@@ -1084,6 +1362,24 @@ def _load_trap_state(session: "GameSession", raw: object) -> None:
         session.dungeon_levels[depth - 1].discovered_traps = _coords_set(
             discovered_coords_raw,
             f"trap_state.dungeon_discovered.{depth}",
+        )
+
+        secret_coords_raw = _expect_list(
+            dungeon_secrets_raw.get(depth_text, []),
+            f"trap_state.dungeon_secrets.{depth}",
+        )
+        session.dungeon_levels[depth - 1].secret_rooms = _coords_set(
+            secret_coords_raw,
+            f"trap_state.dungeon_secrets.{depth}",
+        )
+
+        discovered_secret_coords_raw = _expect_list(
+            dungeon_discovered_secrets_raw.get(depth_text, []),
+            f"trap_state.dungeon_discovered_secrets.{depth}",
+        )
+        session.dungeon_levels[depth - 1].discovered_secrets = _coords_set(
+            discovered_secret_coords_raw,
+            f"trap_state.dungeon_discovered_secrets.{depth}",
         )
 
 
@@ -1147,8 +1443,13 @@ def _load_quest_state(session: "GameSession", raw: object) -> None:
 
 def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
     version = _expect_int(data.get("version", 2), "version")
-    if version == 5:
+    if version == 6:
         return data
+
+    # Any structural migration invalidates prior checksums.
+    data = dict(data)
+    data.pop("integrity", None)
+
     if version == 2:
         migrated = dict(data)
         migrated["version"] = 3
@@ -1194,6 +1495,19 @@ def _migrate_save_data(data: dict[str, object]) -> dict[str, object]:
         quest_state.setdefault("failed", False)
         quest_state.setdefault("journal", [])
         migrated["quest_state"] = quest_state
+        version = 5
+        data = migrated
+
+    if version == 5:
+        migrated = dict(data)
+        migrated["version"] = 6
+        faction_reputation = _expect_dict(
+            migrated.get("faction_reputation", {"townfolk": 0}),
+            "faction_reputation",
+        )
+        faction_reputation.setdefault("arcane_order", 0)
+        faction_reputation.setdefault("wild_clans", 0)
+        migrated["faction_reputation"] = faction_reputation
         return migrated
 
     msg = f"Unsupported save version: {version}"
@@ -1228,8 +1542,8 @@ def _ensure_monster_xp_rewards(session: "GameSession") -> None:
             session.ecs.add_component(entity_id, ExperienceReward(xp=10))
 
 
-def _ensure_phase7_components(session: "GameSession") -> None:
-    """Backfill Phase 6/7 components when loading older saves."""
+def _ensure_phase8_components(session: "GameSession") -> None:
+    """Backfill Phase 6-8 components when loading older saves."""
     if session.ecs.get_component(session.player_entity, Mana) is None:
         session.ecs.add_component(
             session.player_entity,
@@ -1252,8 +1566,9 @@ def _ensure_phase7_components(session: "GameSession") -> None:
     if not session.ecs.entities_with(Npc):
         session._spawn_town_npcs()
 
-    if "townfolk" not in session.faction_reputation:
-        session.faction_reputation["townfolk"] = 0
+    for faction in ("townfolk", "arcane_order", "wild_clans"):
+        if faction not in session.faction_reputation:
+            session.faction_reputation[faction] = 0
 
 
 def _coords_set(raw_list: list[object], field_name: str) -> set[tuple[int, int]]:

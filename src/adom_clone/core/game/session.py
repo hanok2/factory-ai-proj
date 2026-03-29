@@ -33,7 +33,13 @@ from adom_clone.core.ecs.components import (
     Talents,
 )
 from adom_clone.core.ecs.store import ECSStore
-from adom_clone.core.game.actions import GameAction
+from adom_clone.core.game.actions import (
+    CastArcaneBoltAction,
+    CastVenomLanceAction,
+    GameAction,
+    MoveAction,
+    RangedAttackAction,
+)
 from adom_clone.core.game.content import (
     ClassDefinition,
     ItemTemplate,
@@ -134,6 +140,30 @@ TALENT_DEFINITIONS: dict[str, TalentDefinition] = {
     ),
 }
 
+FACTIONS: tuple[str, ...] = (
+    "townfolk",
+    "arcane_order",
+    "wild_clans",
+)
+
+QUEST_UNLOCKS: dict[str, tuple[str, int]] = {
+    "town_goblin_cull": ("townfolk", -10),
+    "arcane_anomaly": ("arcane_order", 5),
+    "clan_beast_hunt": ("wild_clans", 5),
+}
+
+QUEST_TARGETS: dict[str, int] = {
+    "town_goblin_cull": 3,
+    "arcane_anomaly": 4,
+    "clan_beast_hunt": 5,
+}
+
+CORRUPTION_MUTATIONS: tuple[tuple[int, str | None], ...] = (
+    (180, "void_sight"),
+    (100, "chaos_skin"),
+    (0, None),
+)
+
 
 class GameSession:
     """Owns runtime game state and delegates behavior to domain systems."""
@@ -169,7 +199,7 @@ class GameSession:
         self.kill_count = 0
         self.regen_counter = 0
         self.quest_state = QuestState()
-        self.faction_reputation: dict[str, int] = {"townfolk": 0}
+        self.faction_reputation: dict[str, int] = {name: 0 for name in FACTIONS}
         self.save_diagnostics: list[str] = []
         self._action_queue: deque[GameAction] = deque()
 
@@ -356,8 +386,12 @@ class GameSession:
 
     @property
     def faction_text(self) -> str:
-        town_rep = self.faction_reputation.get("townfolk", 0)
-        return f"Townfolk rep: {town_rep}"
+        return (
+            "Rep "
+            f"T:{self.faction_reputation.get('townfolk', 0)} "
+            f"A:{self.faction_reputation.get('arcane_order', 0)} "
+            f"W:{self.faction_reputation.get('wild_clans', 0)}"
+        )
 
     def quest_journal_lines(self) -> list[str]:
         if not self.quest_state.journal:
@@ -369,9 +403,9 @@ class GameSession:
         if len(self.messages) > 250:
             del self.messages[:-250]
 
-    def add_diagnostic(self, text: str) -> None:
-        """Track save/load integrity diagnostics for UI inspection panels."""
-        self.save_diagnostics.append(text)
+    def add_diagnostic(self, category: str, text: str) -> None:
+        """Track categorized save/runtime diagnostics for UI inspection panels."""
+        self.save_diagnostics.append(f"[{category}] {text}")
         if len(self.save_diagnostics) > 100:
             del self.save_diagnostics[:-100]
 
@@ -440,6 +474,8 @@ class GameSession:
                 actual,
                 mitigated,
             )
+            if self._school_mastery(ManaSchool.ARCANE) >= 4:
+                self.apply_status(blocker, confuse=1)
 
             # Talent branch extension: arcane chain can bounce to one adjacent hostile target.
             if "chain_bolt" in self.player_talents.selected:
@@ -497,6 +533,7 @@ class GameSession:
             self.apply_status(
                 blocker,
                 poison=2 + max(0, poison_mastery // 2),
+                slow=1 + poison_mastery // 4,
             )
             self._log_player_damage(
                 blocker,
@@ -785,13 +822,82 @@ class GameSession:
                 self.current_map.discovered_traps.add(trap)
                 self.add_message(f"You spot a hidden trap at {trap}.")
 
+    def detect_nearby_secrets(self) -> None:
+        """Reveal secret-room anchors via exploration and perception checks."""
+        if not self.current_map.secret_rooms:
+            return
+
+        px, py = self.player_position.x, self.player_position.y
+        perception_bonus = 20 if "keen_senses" in self.player_talents.selected else 0
+
+        for secret in list(self.current_map.secret_rooms):
+            if secret in self.current_map.discovered_secrets:
+                continue
+            dist = abs(secret[0] - px) + abs(secret[1] - py)
+            if dist > 5:
+                continue
+            if dist <= 1:
+                self.current_map.discovered_secrets.add(secret)
+                self.add_message(f"You uncover a hidden chamber near {secret}.")
+                continue
+
+            roll = (self.seed + self.turn_count + secret[0] * 7 + secret[1] * 13) % 100
+            if roll < 14 + perception_bonus:
+                self.current_map.discovered_secrets.add(secret)
+                self.add_message(f"You sense a secret chamber near {secret}.")
+
     def consume_player_stun_turn(self) -> bool:
         status = self.player_status
         if status.stun <= 0:
+            if status.slow > 0 and (self.turn_count + self.seed) % 2 == 0:
+                self.add_message("You are slowed and lose momentum this turn.")
+                return True
             return False
         status.stun -= 1
         self.add_message("You are stunned and cannot act.")
         return True
+
+    def resolve_player_action(self, action: GameAction) -> GameAction:
+        status = self.player_status
+        if status.confuse <= 0:
+            return action
+
+        if isinstance(action, MoveAction):
+            dx, dy = self._confused_direction()
+            self.add_message("You stumble in confusion.")
+            return MoveAction(dx, dy)
+        if isinstance(action, RangedAttackAction):
+            dx, dy = self._confused_direction()
+            self.add_message("You fumble your aim in confusion.")
+            return RangedAttackAction(dx, dy)
+        if isinstance(action, CastArcaneBoltAction):
+            dx, dy = self._confused_direction()
+            self.add_message("Your arcane focus wavers.")
+            return CastArcaneBoltAction(dx, dy)
+        if isinstance(action, CastVenomLanceAction):
+            dx, dy = self._confused_direction()
+            self.add_message("Your venom lance veers off course.")
+            return CastVenomLanceAction(dx, dy)
+        return action
+
+    def player_fear_prevents_action(self, action: GameAction) -> bool:
+        status = self.player_status
+        if status.fear <= 0:
+            return False
+        if not self.has_adjacent_monster():
+            return False
+        if isinstance(
+            action,
+            (MoveAction, RangedAttackAction, CastArcaneBoltAction, CastVenomLanceAction),
+        ):
+            self.add_message("Fear grips you and you hesitate.")
+            return True
+        return False
+
+    def _confused_direction(self) -> tuple[int, int]:
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        idx = (self.turn_count + self.seed + self.player_status.confuse) % len(directions)
+        return directions[idx]
 
     def consume_monster_stun_turn(self, entity_id: int) -> bool:
         status = self.ecs.get_component(entity_id, StatusEffects)
@@ -819,6 +925,12 @@ class GameSession:
         if status.bleed > 0:
             status.bleed -= 1
             self.apply_damage(entity_id, 1, DamageType.PHYSICAL, source="bleeding")
+        if status.slow > 0:
+            status.slow -= 1
+        if status.fear > 0:
+            status.fear -= 1
+        if status.confuse > 0:
+            status.confuse -= 1
 
     def apply_natural_regen(self) -> None:
         fighter = self.player_fighter
@@ -836,6 +948,7 @@ class GameSession:
 
         self._regenerate_mana()
         self.detect_nearby_traps()
+        self.detect_nearby_secrets()
 
     def rest_player(self) -> bool:
         if self.has_adjacent_monster():
@@ -902,6 +1015,9 @@ class GameSession:
         poison: int = 0,
         bleed: int = 0,
         stun: int = 0,
+        slow: int = 0,
+        fear: int = 0,
+        confuse: int = 0,
         ward_turns: int = 0,
         ward_strength: int = 0,
     ) -> None:
@@ -916,6 +1032,12 @@ class GameSession:
             status.bleed = max(status.bleed, bleed)
         if stun > 0:
             status.stun = max(status.stun, stun)
+        if slow > 0:
+            status.slow = max(status.slow, slow)
+        if fear > 0:
+            status.fear = max(status.fear, fear)
+        if confuse > 0:
+            status.confuse = max(status.confuse, confuse)
         if ward_turns > 0:
             status.ward_turns = max(status.ward_turns, ward_turns)
         if ward_strength > 0:
@@ -971,20 +1093,73 @@ class GameSession:
             self.add_message(f"You are starving! ({actual} damage, {mitigated} resisted)")
 
     def tick_corruption(self) -> None:
-        """Advance corruption in dungeon zones and trigger baseline mutations."""
+        """Advance corruption in dungeon zones and evolve mutation stages."""
         if self.current_map.kind != MapKind.DUNGEON:
             return
 
         corruption = self.player_corruption
         depth = self.current_depth or 1
         corruption.value += 1 + depth // 2
+        self._refresh_corruption_mutation()
 
-        if corruption.mutation is None and corruption.value >= 100:
-            corruption.mutation = "chaos_skin"
-            # Mutation baseline effect: higher arcane resistance, lower base defense.
-            self.player_resistances.arcane_pct = min(80, self.player_resistances.arcane_pct + 15)
-            self.player_fighter.defense = max(0, self.player_fighter.defense - 1)
+    def reduce_corruption(self, amount: int, *, source: str) -> int:
+        corruption = self.player_corruption
+        before = corruption.value
+        corruption.value = max(0, corruption.value - max(0, amount))
+        reduced = before - corruption.value
+        if reduced > 0:
+            self.add_message(f"{source} reduces corruption by {reduced}.")
+            self._refresh_corruption_mutation()
+        return reduced
+
+    def _refresh_corruption_mutation(self) -> None:
+        corruption = self.player_corruption
+        new_mutation = self._mutation_for_corruption(corruption.value)
+        old_mutation = corruption.mutation
+        if old_mutation == new_mutation:
+            return
+
+        self._apply_mutation_transition(old_mutation, new_mutation)
+        corruption.mutation = new_mutation
+
+        if new_mutation is None:
+            self.add_message("Your corruption recedes and your form stabilizes.")
+            return
+        if new_mutation == "chaos_skin":
             self.add_message("Corruption mutates your skin with unstable arcane patterns.")
+            return
+        self.add_message("Corruption deepens; your senses distort into void sight.")
+
+    def _mutation_for_corruption(self, value: int) -> str | None:
+        for threshold, mutation in CORRUPTION_MUTATIONS:
+            if value >= threshold:
+                return mutation
+        return None
+
+    def _apply_mutation_transition(
+        self,
+        old_mutation: str | None,
+        new_mutation: str | None,
+    ) -> None:
+        old_def, old_arc, old_poi = self._mutation_effects(old_mutation)
+        new_def, new_arc, new_poi = self._mutation_effects(new_mutation)
+
+        self.player_fighter.defense = max(0, self.player_fighter.defense + (new_def - old_def))
+        self.player_resistances.arcane_pct = max(
+            0,
+            min(80, self.player_resistances.arcane_pct + (new_arc - old_arc)),
+        )
+        self.player_resistances.poison_pct = max(
+            0,
+            min(80, self.player_resistances.poison_pct + (new_poi - old_poi)),
+        )
+
+    def _mutation_effects(self, mutation: str | None) -> tuple[int, int, int]:
+        if mutation == "chaos_skin":
+            return (-1, 15, 0)
+        if mutation == "void_sight":
+            return (-2, 20, 5)
+        return (0, 0, 0)
 
     def tick_quest_timers(self) -> None:
         """Fail active quests when their deadline expires."""
@@ -1000,6 +1175,14 @@ class GameSession:
         quest.stage = 4
         quest.completed = False
         self.faction_reputation["townfolk"] = self.faction_reputation.get("townfolk", 0) - 5
+        if quest.quest_id == "arcane_anomaly":
+            self.faction_reputation["arcane_order"] = (
+                self.faction_reputation.get("arcane_order", 0) - 4
+            )
+        if quest.quest_id == "clan_beast_hunt":
+            self.faction_reputation["wild_clans"] = (
+                self.faction_reputation.get("wild_clans", 0) - 4
+            )
         quest.journal.append("Quest failed: you returned too late.")
         self.add_message("Quest failed: you missed the deadline.")
 
@@ -1102,6 +1285,16 @@ class GameSession:
         if reward is not None:
             self.grant_player_xp(reward.xp)
 
+        if monster is not None:
+            if monster.faction == "arcane_order":
+                self.faction_reputation["arcane_order"] = (
+                    self.faction_reputation.get("arcane_order", 0) - 1
+                )
+            elif monster.faction == "wild_clans":
+                self.faction_reputation["wild_clans"] = (
+                    self.faction_reputation.get("wild_clans", 0) - 1
+                )
+
         if (
             self.quest_state.accepted
             and not self.quest_state.failed
@@ -1197,6 +1390,9 @@ class GameSession:
 
     def trap_positions(self) -> list[tuple[int, int]]:
         return sorted(self.current_map.discovered_traps)
+
+    def secret_positions(self) -> list[tuple[int, int]]:
+        return sorted(self.current_map.discovered_secrets)
 
     def inventory_names(self) -> list[str]:
         names: list[str] = []
@@ -1314,15 +1510,50 @@ class GameSession:
                 self._spawn_item_on_map(template, map_kind, depth, pos[0], pos[1])
 
     def _spawn_monster_rules(self, rules: tuple[SpawnRule, ...], depth: int) -> None:
-        for rule in rules:
-            template = self.spawn_content.monster_templates.get(rule.template_id)
+        biome = self.map_for_depth(depth).biome
+        eligible_rules = [
+            rule
+            for rule in rules
+            if self._is_spawn_rule_eligible(rule, depth, biome)
+        ]
+        if not eligible_rules:
+            return
+
+        spawn_count = sum(max(0, rule.count) for rule in eligible_rules)
+        for _ in range(spawn_count):
+            selected_rule = self._pick_weighted_spawn_rule(eligible_rules)
+            if selected_rule is None:
+                continue
+            template = self.spawn_content.monster_templates.get(selected_rule.template_id)
             if template is None:
                 continue
-            for _ in range(rule.count):
-                pos = self._random_spawn_position(MapKind.DUNGEON, depth)
-                if pos is None:
-                    continue
-                self._spawn_monster(template, depth, pos[0], pos[1])
+
+            pos = self._random_spawn_position(MapKind.DUNGEON, depth)
+            if pos is None:
+                continue
+            self._spawn_monster(template, depth, pos[0], pos[1])
+
+    def _is_spawn_rule_eligible(self, rule: SpawnRule, depth: int, biome: str) -> bool:
+        if rule.min_depth is not None and depth < rule.min_depth:
+            return False
+        if rule.max_depth is not None and depth > rule.max_depth:
+            return False
+        if rule.biomes and biome not in rule.biomes:
+            return False
+        return True
+
+    def _pick_weighted_spawn_rule(self, rules: list[SpawnRule]) -> SpawnRule | None:
+        total_weight = sum(max(1, rule.weight) for rule in rules)
+        if total_weight <= 0:
+            return None
+
+        roll = self.rng.randint(1, total_weight)
+        running = 0
+        for rule in rules:
+            running += max(1, rule.weight)
+            if roll <= running:
+                return rule
+        return rules[-1]
 
     def _random_spawn_position(
         self,
@@ -1359,7 +1590,10 @@ class GameSession:
 
     def _spawn_monster(self, template: MonsterTemplate, depth: int, x: int, y: int) -> None:
         entity_id = self.ecs.create_entity()
-        self.ecs.add_component(entity_id, Monster(name=template.name))
+        self.ecs.add_component(
+            entity_id,
+            Monster(name=template.name, role=template.role, faction=template.faction),
+        )
         self.ecs.add_component(
             entity_id,
             Fighter(
@@ -1537,16 +1771,25 @@ class GameSession:
             source="trap",
         )
 
-        selector = (pos[0] * 31 + pos[1] * 17 + depth) % 3
+        selector = (pos[0] * 31 + pos[1] * 17 + depth) % 6
         if selector == 0:
             self.apply_status(self.player_entity, poison=3)
             effect_text = "poison"
         elif selector == 1:
             self.apply_status(self.player_entity, bleed=3)
             effect_text = "bleeding"
-        else:
+        elif selector == 2:
             self.apply_status(self.player_entity, stun=1)
             effect_text = "stun"
+        elif selector == 3:
+            self.apply_status(self.player_entity, slow=3)
+            effect_text = "slow"
+        elif selector == 4:
+            self.apply_status(self.player_entity, fear=2)
+            effect_text = "fear"
+        else:
+            self.apply_status(self.player_entity, confuse=2)
+            effect_text = "confusion"
 
         self.add_message(
             f"You trigger a trap for {actual} physical damage ({mitigated} resisted)"
@@ -1594,12 +1837,26 @@ class GameSession:
             self.add_message(f"{npc.name}: You failed the last assignment. Earn my trust first.")
             return True
 
+        required_faction, required_rep = QUEST_UNLOCKS.get(
+            quest.quest_id,
+            ("townfolk", -10),
+        )
+        current_rep = self.faction_reputation.get(required_faction, 0)
+
         if not quest.accepted:
+            if current_rep < required_rep:
+                self.add_message(
+                    f"{npc.name}: Improve {required_faction} reputation "
+                    f"to at least {required_rep} before this contract.",
+                )
+                return True
+
             quest.accepted = True
             quest.stage = 1
             quest.kills_progress = 0
             quest.completed = False
             quest.turned_in = False
+            quest.target_kills = QUEST_TARGETS.get(quest.quest_id, quest.target_kills)
             quest.deadline_turn = self.turn_count + 180
             quest.journal.append(
                 f"Accepted quest from {npc.name}: eliminate {quest.target_kills} monsters "
@@ -1627,8 +1884,37 @@ class GameSession:
             self.grant_player_xp(25)
             self._grant_reward_item("healing_potion")
             self.faction_reputation["townfolk"] = town_rep + 8
+            self.faction_reputation["arcane_order"] = (
+                self.faction_reputation.get("arcane_order", 0) + 4
+            )
+            self.faction_reputation["wild_clans"] = (
+                self.faction_reputation.get("wild_clans", 0) + 3
+            )
             quest.journal.append("Quest turned in. Captain Durn rewarded you.")
             self.add_message(f"{npc.name}: Excellent work. Take this reward.")
+
+            if quest.quest_id == "town_goblin_cull":
+                quest.quest_id = "arcane_anomaly"
+                quest.accepted = False
+                quest.completed = False
+                quest.turned_in = False
+                quest.failed = False
+                quest.stage = 0
+                quest.kills_progress = 0
+                quest.target_kills = QUEST_TARGETS["arcane_anomaly"]
+                quest.deadline_turn = 0
+                quest.journal.append("New contract unlocked: Arcane Anomaly.")
+            elif quest.quest_id == "arcane_anomaly":
+                quest.quest_id = "clan_beast_hunt"
+                quest.accepted = False
+                quest.completed = False
+                quest.turned_in = False
+                quest.failed = False
+                quest.stage = 0
+                quest.kills_progress = 0
+                quest.target_kills = QUEST_TARGETS["clan_beast_hunt"]
+                quest.deadline_turn = 0
+                quest.journal.append("New contract unlocked: Clan Beast Hunt.")
             return True
 
         self.add_message(f"{npc.name}: You have already proven yourself.")
@@ -1641,7 +1927,17 @@ class GameSession:
             return True
 
         fighter = self.player_fighter
-        if fighter.hp >= fighter.max_hp and self.player_mana.current >= self.player_mana.max_value:
+        if (
+            fighter.hp >= fighter.max_hp
+            and self.player_mana.current >= self.player_mana.max_value
+            and self.player_corruption.value <= 0
+            and self.player_status.poison <= 0
+            and self.player_status.bleed <= 0
+            and self.player_status.stun <= 0
+            and self.player_status.slow <= 0
+            and self.player_status.fear <= 0
+            and self.player_status.confuse <= 0
+        ):
             self.add_message(f"{npc.name}: You are already in peak condition.")
             return True
 
@@ -1650,8 +1946,15 @@ class GameSession:
         self.player_status.poison = 0
         self.player_status.bleed = 0
         self.player_status.stun = 0
+        self.player_status.slow = 0
+        self.player_status.fear = 0
+        self.player_status.confuse = 0
         self.player_status.ward_turns = 0
         self.player_status.ward_strength = 0
+        self.reduce_corruption(35, source=npc.name)
+        self.faction_reputation["wild_clans"] = (
+            self.faction_reputation.get("wild_clans", 0) + 1
+        )
         self.add_message(f"{npc.name} restores your health, mana, and cleanses ailments.")
         return True
 
@@ -1671,6 +1974,9 @@ class GameSession:
         else:
             reward_template = "ration" if self.turn_count % 2 == 0 else "throwing_knife"
         self._grant_reward_item(reward_template)
+        self.faction_reputation["arcane_order"] = (
+            self.faction_reputation.get("arcane_order", 0) + 1
+        )
         self.add_message(f"{npc.name} hands you a {reward_template.replace('_', ' ')}.")
         return True
 

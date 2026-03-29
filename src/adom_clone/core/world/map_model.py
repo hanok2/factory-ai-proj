@@ -31,6 +31,8 @@ class TileMap:
     vault_pos: tuple[int, int] | None = None
     trap_positions: set[tuple[int, int]] = field(default_factory=set)
     discovered_traps: set[tuple[int, int]] = field(default_factory=set)
+    secret_rooms: set[tuple[int, int]] = field(default_factory=set)
+    discovered_secrets: set[tuple[int, int]] = field(default_factory=set)
 
     def in_bounds(self, x: int, y: int) -> bool:
         return 0 <= x < self.width and 0 <= y < self.height

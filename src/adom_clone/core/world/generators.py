@@ -144,6 +144,15 @@ def generate_dungeon(
         vault_pos=vault_pos,
     )
 
+    secret_rooms = _generate_secret_rooms(
+        rng=rng,
+        left=left,
+        top=top,
+        right=right,
+        bottom=bottom,
+        blocked_positions={exit_pos, stairs_down_pos, vault_pos},
+    )
+
     return TileMap(
         kind=MapKind.DUNGEON,
         width=width,
@@ -156,6 +165,7 @@ def generate_dungeon(
         stairs_down_pos=stairs_down_pos,
         vault_pos=vault_pos,
         trap_positions=trap_positions,
+        secret_rooms=secret_rooms,
     )
 
 
@@ -296,3 +306,27 @@ def _generate_trap_positions(
     rng.shuffle(candidates)
     trap_count = min(len(candidates), 2 + depth)
     return set(candidates[:trap_count])
+
+
+def _generate_secret_rooms(
+    *,
+    rng: random.Random,
+    left: int,
+    top: int,
+    right: int,
+    bottom: int,
+    blocked_positions: set[tuple[int, int] | None],
+) -> set[tuple[int, int]]:
+    candidates: list[tuple[int, int]] = []
+    for y in range(top + 1, bottom - 1):
+        for x in range(left + 1, right - 1):
+            pos = (x, y)
+            if pos in blocked_positions:
+                continue
+            candidates.append(pos)
+
+    if not candidates:
+        return set()
+
+    rng.shuffle(candidates)
+    return set(candidates[:2])

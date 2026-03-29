@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from typing import cast
 
-from adom_clone.core.ecs.components import EquipmentSlot
+from adom_clone.core.ecs.components import EquipmentSlot, MonsterRole
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,8 @@ class MonsterTemplate:
     power: int
     defense: int
     xp_reward: int
+    role: MonsterRole
+    faction: str
     physical_resist: int
     poison_resist: int
     arcane_resist: int
@@ -67,6 +69,10 @@ class MonsterTemplate:
 class SpawnRule:
     template_id: str
     count: int
+    weight: int = 1
+    biomes: tuple[str, ...] = ()
+    min_depth: int | None = None
+    max_depth: int | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,16 @@ def _parse_monster_template(template_id: str, raw: object) -> MonsterTemplate:
             data.get("xp_reward", 10),
             f"monster_templates.{template_id}.xp_reward",
         ),
+        role=MonsterRole(
+            _expect_str(
+                data.get("role", MonsterRole.BRUTE.value),
+                f"monster_templates.{template_id}.role",
+            ),
+        ),
+        faction=_expect_str(
+            data.get("faction", "dungeon_denizens"),
+            f"monster_templates.{template_id}.faction",
+        ),
         physical_resist=_expect_int(
             data.get("physical_resist", 0),
             f"monster_templates.{template_id}.physical_resist",
@@ -254,9 +270,25 @@ def _parse_monster_template(template_id: str, raw: object) -> MonsterTemplate:
 
 def _parse_spawn_rule(raw: object) -> SpawnRule:
     data = _expect_dict(raw, "spawn_rule")
+    biomes_raw = _expect_list(data.get("biomes", []), "spawn_rule.biomes")
+    biomes = tuple(_expect_str(item, "spawn_rule.biome") for item in biomes_raw)
+    min_depth_raw = data.get("min_depth")
+    max_depth_raw = data.get("max_depth")
     return SpawnRule(
         template_id=_expect_str(data.get("template"), "spawn_rule.template"),
         count=_expect_int(data.get("count"), "spawn_rule.count"),
+        weight=_expect_int(data.get("weight", 1), "spawn_rule.weight"),
+        biomes=biomes,
+        min_depth=(
+            None
+            if min_depth_raw is None
+            else _expect_int(min_depth_raw, "spawn_rule.min_depth")
+        ),
+        max_depth=(
+            None
+            if max_depth_raw is None
+            else _expect_int(max_depth_raw, "spawn_rule.max_depth")
+        ),
     )
 
 

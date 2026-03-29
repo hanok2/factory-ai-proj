@@ -15,9 +15,18 @@ class Player:
     pass
 
 
+class MonsterRole(str, Enum):
+    BRUTE = "brute"
+    SKIRMISHER = "skirmisher"
+    CASTER = "caster"
+    SUPPORT = "support"
+
+
 @dataclass(slots=True)
 class Monster:
     name: str
+    role: MonsterRole = MonsterRole.BRUTE
+    faction: str = "dungeon_denizens"
 
 
 @dataclass(slots=True)
@@ -96,6 +105,9 @@ class StatusEffects:
     poison: int = 0
     bleed: int = 0
     stun: int = 0
+    slow: int = 0
+    fear: int = 0
+    confuse: int = 0
     ward_turns: int = 0
     ward_strength: int = 0
 
